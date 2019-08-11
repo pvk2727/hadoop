@@ -17,7 +17,7 @@
 */
 package org.apache.hadoop.mapreduce.v2.app.local;
 
-import static org.mockito.Matchers.isA;
+import static org.mockito.ArgumentMatchers.isA;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -59,6 +59,7 @@ import org.apache.hadoop.yarn.api.records.NMToken;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.UpdatedContainer;
 import org.apache.hadoop.yarn.client.ClientRMProxy;
 import org.apache.hadoop.yarn.event.Event;
 import org.apache.hadoop.yarn.event.EventHandler;
@@ -246,8 +247,8 @@ public class TestLocalContainerAllocator {
       ApplicationAttemptId attemptId =
           ApplicationAttemptId.newInstance(appId, 1);
       Job job = mock(Job.class);
-      @SuppressWarnings("rawtypes")
-      EventHandler eventHandler = mock(EventHandler.class);
+      @SuppressWarnings("unchecked")
+      EventHandler<Event> eventHandler = mock(EventHandler.class);
       AppContext ctx = mock(AppContext.class);
       when(ctx.getApplicationID()).thenReturn(appId);
       when(ctx.getApplicationAttemptId()).thenReturn(attemptId);
@@ -296,8 +297,7 @@ public class TestLocalContainerAllocator {
           Resources.none(), null, 1, null,
           Collections.<NMToken>emptyList(),
           yarnToken,
-          Collections.<Container>emptyList(),
-          Collections.<Container>emptyList());
+          Collections.<UpdatedContainer>emptyList());
       response.setApplicationPriority(Priority.newInstance(0));
       return response;
     }

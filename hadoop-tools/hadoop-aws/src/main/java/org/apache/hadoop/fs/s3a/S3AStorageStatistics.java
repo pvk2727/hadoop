@@ -22,6 +22,7 @@ import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.fs.StorageStatistics;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.EnumMap;
@@ -35,8 +36,10 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 @InterfaceAudience.Private
 @InterfaceStability.Evolving
-public class S3AStorageStatistics extends StorageStatistics {
-  private static final Logger LOG = S3AFileSystem.LOG;
+public class S3AStorageStatistics extends StorageStatistics
+    implements Iterable<StorageStatistics.LongStatistic> {
+  private static final Logger LOG =
+      LoggerFactory.getLogger(S3AStorageStatistics.class);
 
   public static final String NAME = "S3AStorageStatistics";
   private final Map<Statistic, AtomicLong> opsCount =
@@ -76,7 +79,8 @@ public class S3AStorageStatistics extends StorageStatistics {
         throw new NoSuchElementException();
       }
       final Map.Entry<Statistic, AtomicLong> entry = iterator.next();
-      return new LongStatistic(entry.getKey().name(), entry.getValue().get());
+      return new LongStatistic(entry.getKey().getSymbol(),
+          entry.getValue().get());
     }
 
     @Override
@@ -86,8 +90,18 @@ public class S3AStorageStatistics extends StorageStatistics {
   }
 
   @Override
+  public String getScheme() {
+    return "s3a";
+  }
+
+  @Override
   public Iterator<LongStatistic> getLongStatistics() {
     return new LongIterator();
+  }
+
+  @Override
+  public Iterator<LongStatistic> iterator() {
+    return getLongStatistics();
   }
 
   @Override
@@ -98,7 +112,14 @@ public class S3AStorageStatistics extends StorageStatistics {
 
   @Override
   public boolean isTracked(String key) {
-    return Statistic.fromSymbol(key) == null;
+    return Statistic.fromSymbol(key) != null;
+  }
+
+  @Override
+  public void reset() {
+    for (AtomicLong value : opsCount.values()) {
+      value.set(0);
+    }
   }
 
 }

@@ -18,7 +18,6 @@
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.application;
 
 import static org.junit.Assert.assertEquals;
-import static org.mockito.Matchers.*;
 import static org.mockito.Mockito.*;
 
 import java.io.IOException;
@@ -34,7 +33,9 @@ import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.Priority;
+import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.event.DrainDispatcher;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.proto.YarnServerNodemanagerRecoveryProtos.ContainerManagerApplicationProto;
@@ -260,7 +261,8 @@ public class TestApplication {
 
       verify(wa.localizerBus).handle(
           refEq(new ApplicationLocalizationEvent(
-              LocalizationEventType.DESTROY_APPLICATION_RESOURCES, wa.app)));
+              LocalizationEventType.DESTROY_APPLICATION_RESOURCES,
+              wa.app), "timestamp"));
 
       verify(wa.auxBus).handle(
           refEq(new AuxServicesEvent(
@@ -339,7 +341,8 @@ public class TestApplication {
 
       verify(wa.localizerBus).handle(
           refEq(new ApplicationLocalizationEvent(
-              LocalizationEventType.DESTROY_APPLICATION_RESOURCES, wa.app)));
+              LocalizationEventType.DESTROY_APPLICATION_RESOURCES, wa.app),
+              "timestamp"));
 
       wa.appResourcesCleanedup();
       for ( Container container : wa.containers) {
@@ -356,34 +359,65 @@ public class TestApplication {
     }
   }
 
-//TODO Re-work after Application transitions are changed.
-//  @Test
+  @Test
   @SuppressWarnings("unchecked")
-  public void testStartContainerAfterAppFinished() {
+  public void testStartContainerAfterAppRunning() {
     WrappedApplication wa = null;
     try {
-      wa = new WrappedApplication(5, 314159265358979L, "yak", 3);
+      wa = new WrappedApplication(5, 314159265358979L, "yak", 4);
       wa.initApplication();
-      wa.initContainer(-1);
+      wa.initContainer(0);
       assertEquals(ApplicationState.INITING, wa.app.getApplicationState());
       wa.applicationInited();
       assertEquals(ApplicationState.RUNNING, wa.app.getApplicationState());
 
-      reset(wa.localizerBus);
-      wa.containerFinished(0);
-      wa.containerFinished(1);
-      wa.containerFinished(2);
       assertEquals(ApplicationState.RUNNING, wa.app.getApplicationState());
-      assertEquals(0, wa.app.getContainers().size());
+      assertEquals(1, wa.app.getContainers().size());
 
       wa.appFinished();
+      verify(wa.containerBus).handle(
+          argThat(new ContainerKillMatcher(wa.containers.get(0)
+              .getContainerId())));
+      assertEquals(ApplicationState.FINISHING_CONTAINERS_WAIT,
+          wa.app.getApplicationState());
+
+      wa.initContainer(1);
+      verify(wa.containerBus).handle(
+          argThat(new ContainerKillMatcher(wa.containers.get(1)
+              .getContainerId())));
+      assertEquals(ApplicationState.FINISHING_CONTAINERS_WAIT,
+          wa.app.getApplicationState());
+      wa.containerFinished(1);
+      assertEquals(ApplicationState.FINISHING_CONTAINERS_WAIT,
+          wa.app.getApplicationState());
+
+      wa.containerFinished(0);
       assertEquals(ApplicationState.APPLICATION_RESOURCES_CLEANINGUP,
           wa.app.getApplicationState());
       verify(wa.localizerBus).handle(
           refEq(new ApplicationLocalizationEvent(
-              LocalizationEventType.DESTROY_APPLICATION_RESOURCES, wa.app)));
+              LocalizationEventType.DESTROY_APPLICATION_RESOURCES,
+              wa.app), "timestamp"));
+
+      wa.initContainer(2);
+      verify(wa.containerBus).handle(
+          argThat(new ContainerKillMatcher(wa.containers.get(2)
+              .getContainerId())));
+      assertEquals(ApplicationState.APPLICATION_RESOURCES_CLEANINGUP,
+          wa.app.getApplicationState());
+      wa.containerFinished(2);
+      assertEquals(ApplicationState.APPLICATION_RESOURCES_CLEANINGUP,
+          wa.app.getApplicationState());
 
       wa.appResourcesCleanedup();
+      assertEquals(ApplicationState.FINISHED, wa.app.getApplicationState());
+
+      wa.initContainer(3);
+      verify(wa.containerBus).handle(
+          argThat(new ContainerKillMatcher(wa.containers.get(3)
+              .getContainerId())));
+      assertEquals(ApplicationState.FINISHED, wa.app.getApplicationState());
+      wa.containerFinished(3);
       assertEquals(ApplicationState.FINISHED, wa.app.getApplicationState());
     } finally {
       if (wa != null)
@@ -455,7 +489,8 @@ public class TestApplication {
     }
   }
 
-  private class ContainerKillMatcher extends ArgumentMatcher<ContainerEvent> {
+  private class ContainerKillMatcher implements
+      ArgumentMatcher<ContainerEvent> {
     private ContainerId cId;
 
     public ContainerKillMatcher(ContainerId cId) {
@@ -463,7 +498,7 @@ public class TestApplication {
     }
 
     @Override
-    public boolean matches(Object argument) {
+    public boolean matches(ContainerEvent argument) {
       if (argument instanceof ContainerKillEvent) {
         ContainerKillEvent event = (ContainerKillEvent) argument;
         return event.getContainerID().equals(cId);
@@ -472,7 +507,8 @@ public class TestApplication {
     }
   }
 
-  private class ContainerInitMatcher extends ArgumentMatcher<ContainerEvent> {
+  private class ContainerInitMatcher implements
+      ArgumentMatcher<ContainerEvent> {
     private ContainerId cId;
 
     public ContainerInitMatcher(ContainerId cId) {
@@ -480,7 +516,7 @@ public class TestApplication {
     }
 
     @Override
-    public boolean matches(Object argument) {
+    public boolean matches(ContainerEvent argument) {
       if (argument instanceof ContainerInitEvent) {
         ContainerInitEvent event = (ContainerInitEvent) argument;
         return event.getContainerID().equals(cId);
@@ -539,7 +575,8 @@ public class TestApplication {
         new ApplicationACLsManager(conf));
       when(context.getNMTokenSecretManager()).thenReturn(nmTokenSecretMgr);
       when(context.getNMStateStore()).thenReturn(stateStoreService);
-      
+      when(context.getConf()).thenReturn(conf);
+
       // Setting master key
       MasterKey masterKey = new MasterKeyPBImpl();
       masterKey.setKeyId(123);
@@ -550,7 +587,8 @@ public class TestApplication {
       this.user = user;
       this.appId = BuilderUtils.newApplicationId(timestamp, id);
 
-      app = new ApplicationImpl(dispatcher, this.user, appId, null, context);
+      app = new ApplicationImpl(
+          dispatcher, this.user, appId, null, context);
       containers = new ArrayList<Container>();
       for (int i = 0; i < numContainers; i++) {
         Container container = createMockedContainer(this.appId, i);
@@ -597,7 +635,7 @@ public class TestApplication {
 
     public void containerFinished(int containerNum) {
       app.handle(new ApplicationContainerFinishedEvent(containers.get(
-          containerNum).getContainerId()));
+          containerNum).cloneAndGetContainerStatus(), 0));
       drainDispatcherEvents();
     }
 
@@ -641,6 +679,9 @@ public class TestApplication {
     when(c.getLaunchContext()).thenReturn(launchContext);
     when(launchContext.getApplicationACLs()).thenReturn(
         new HashMap<ApplicationAccessType, String>());
+    when(c.cloneAndGetContainerStatus()).thenReturn(
+        BuilderUtils.newContainerStatus(cId,
+            ContainerState.NEW, "", 0, Resource.newInstance(1024, 1)));
     return c;
   }
 }

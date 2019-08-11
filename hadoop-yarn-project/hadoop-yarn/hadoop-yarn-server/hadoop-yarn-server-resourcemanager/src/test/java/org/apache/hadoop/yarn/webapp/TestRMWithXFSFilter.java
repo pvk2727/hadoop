@@ -19,8 +19,6 @@
 package org.apache.hadoop.yarn.webapp;
 
 import com.google.inject.Guice;
-import com.google.inject.Injector;
-import com.google.inject.servlet.GuiceServletContextListener;
 import com.google.inject.servlet.ServletModule;
 import com.sun.jersey.api.client.ClientResponse;
 import com.sun.jersey.api.client.WebResource;
@@ -41,8 +39,8 @@ import org.junit.Test;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
 
 /**
  * Used TestRMWebServices as an example of web invocations of RM and added
@@ -51,19 +49,6 @@ import static org.junit.Assert.assertTrue;
 public class TestRMWithXFSFilter extends JerseyTestBase {
 
   private static MockRM rm;
-
-  private Injector injector;
-
-  /**
-   *
-   */
-  public class GuiceServletConfig extends GuiceServletContextListener {
-
-    @Override
-    protected Injector getInjector() {
-      return injector;
-    }
-  }
 
   @Before
   @Override
@@ -87,9 +72,9 @@ public class TestRMWithXFSFilter extends JerseyTestBase {
     ClientResponse response = r.path("ws").path("v1").path("cluster")
         .path("info").accept("application/xml")
         .get(ClientResponse.class);
-    assertTrue("Should have received DENY x-frame options header",
-        response.getHeaders().get(XFrameOptionsFilter.X_FRAME_OPTIONS).get(0)
-            .equals("DENY"));
+    assertEquals("Should have received DENY x-frame options header",
+        "DENY",
+        response.getHeaders().get(XFrameOptionsFilter.X_FRAME_OPTIONS).get(0));
   }
 
   protected void createInjector(String headerValue) {
@@ -103,7 +88,7 @@ public class TestRMWithXFSFilter extends JerseyTestBase {
 
   protected void createInjector(final String headerValue,
       final boolean explicitlyDisabled) {
-    injector = Guice.createInjector(new ServletModule() {
+    GuiceServletConfig.setInjector(Guice.createInjector(new ServletModule() {
       @Override
       protected void configureServlets() {
         bind(JAXBContextResolver.class);
@@ -127,7 +112,7 @@ public class TestRMWithXFSFilter extends JerseyTestBase {
 
         filter("/*").through(xfsFilter, initParams);
       }
-    });
+    }));
   }
 
   @Test
@@ -138,9 +123,9 @@ public class TestRMWithXFSFilter extends JerseyTestBase {
     ClientResponse response = r.path("ws").path("v1").path("cluster")
         .path("info").accept("application/xml")
         .get(ClientResponse.class);
-    assertTrue("Should have received SAMEORIGIN x-frame options header",
-        response.getHeaders().get(XFrameOptionsFilter.X_FRAME_OPTIONS).get(0)
-            .equals("SAMEORIGIN"));
+    assertEquals("Should have received SAMEORIGIN x-frame options header",
+        "SAMEORIGIN",
+        response.getHeaders().get(XFrameOptionsFilter.X_FRAME_OPTIONS).get(0));
   }
 
   @Test

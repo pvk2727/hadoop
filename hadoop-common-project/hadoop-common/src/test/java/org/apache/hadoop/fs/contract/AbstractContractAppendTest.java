@@ -61,6 +61,19 @@ public abstract class AbstractContractAppendTest extends AbstractFSContractTestB
   }
 
   @Test
+  public void testBuilderAppendToEmptyFile() throws Throwable {
+    touch(getFileSystem(), target);
+    byte[] dataset = dataset(256, 'a', 'z');
+    try (FSDataOutputStream outputStream =
+             getFileSystem().appendFile(target).build()) {
+      outputStream.write(dataset);
+    }
+    byte[] bytes = ContractTestUtils.readDataset(getFileSystem(), target,
+        dataset.length);
+    ContractTestUtils.compareByteArrays(dataset, bytes, dataset.length);
+  }
+
+  @Test
   public void testAppendNonexistentFile() throws Throwable {
     try {
       FSDataOutputStream out = getFileSystem().append(target);
@@ -78,13 +91,27 @@ public abstract class AbstractContractAppendTest extends AbstractFSContractTestB
     byte[] original = dataset(8192, 'A', 'Z');
     byte[] appended = dataset(8192, '0', '9');
     createFile(getFileSystem(), target, false, original);
-    FSDataOutputStream outputStream = getFileSystem().append(target);
-      outputStream.write(appended);
-      outputStream.close();
+    try (FSDataOutputStream out = getFileSystem().append(target)) {
+      out.write(appended);
+    }
     byte[] bytes = ContractTestUtils.readDataset(getFileSystem(), target,
                                                  original.length + appended.length);
     ContractTestUtils.validateFileContent(bytes,
             new byte[] [] { original, appended });
+  }
+
+  @Test
+  public void testBuilderAppendToExistingFile() throws Throwable {
+    byte[] original = dataset(8192, 'A', 'Z');
+    byte[] appended = dataset(8192, '0', '9');
+    createFile(getFileSystem(), target, false, original);
+    try (FSDataOutputStream out = getFileSystem().appendFile(target).build()) {
+      out.write(appended);
+    }
+    byte[] bytes = ContractTestUtils.readDataset(getFileSystem(), target,
+        original.length + appended.length);
+    ContractTestUtils.validateFileContent(bytes,
+        new byte[][]{original, appended});
   }
 
   @Test
@@ -106,6 +133,12 @@ public abstract class AbstractContractAppendTest extends AbstractFSContractTestB
     assertPathExists("original file does not exist", target);
     byte[] dataset = dataset(256, 'a', 'z');
     FSDataOutputStream outputStream = getFileSystem().append(target);
+    if (isSupported(CREATE_VISIBILITY_DELAYED)) {
+      // Some filesystems like WebHDFS doesn't assure sequential consistency.
+      // In such a case, delay is needed. Given that we can not check the lease
+      // because here is closed in client side package, simply add a sleep.
+      Thread.sleep(100);
+    }
     outputStream.write(dataset);
     Path renamed = new Path(testPath, "renamed");
     rename(target, renamed);

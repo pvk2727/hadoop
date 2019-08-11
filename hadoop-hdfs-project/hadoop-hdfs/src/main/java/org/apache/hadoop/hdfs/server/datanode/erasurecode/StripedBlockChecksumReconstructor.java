@@ -19,11 +19,10 @@ package org.apache.hadoop.hdfs.server.datanode.erasurecode;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
+import java.util.Arrays;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.io.DataOutputBuffer;
-import org.apache.hadoop.io.MD5Hash;
 
 /**
  * StripedBlockChecksumReconstructor reconstruct one or more missed striped
@@ -32,27 +31,30 @@ import org.apache.hadoop.io.MD5Hash;
  * using the newly reconstructed block.
  */
 @InterfaceAudience.Private
-public class StripedBlockChecksumReconstructor extends StripedReconstructor {
-
+public abstract class StripedBlockChecksumReconstructor
+    extends StripedReconstructor {
   private ByteBuffer targetBuffer;
   private final byte[] targetIndices;
 
   private byte[] checksumBuf;
   private DataOutputBuffer checksumWriter;
-  private MD5Hash md5;
   private long checksumDataLen;
+  private long requestedLen;
 
-  public StripedBlockChecksumReconstructor(ErasureCodingWorker worker,
+  protected StripedBlockChecksumReconstructor(ErasureCodingWorker worker,
       StripedReconstructionInfo stripedReconInfo,
-      DataOutputBuffer checksumWriter) throws IOException {
+      DataOutputBuffer checksumWriter,
+      long requestedBlockLength) throws IOException {
     super(worker, stripedReconInfo);
     this.targetIndices = stripedReconInfo.getTargetIndices();
     assert targetIndices != null;
     this.checksumWriter = checksumWriter;
+    this.requestedLen = requestedBlockLength;
     init();
   }
 
   private void init() throws IOException {
+    initDecoderIfNecessary();
     getStripedReader().init();
     // allocate buffer to keep the reconstructed block data
     targetBuffer = allocateBuffer(getBufferSize());
@@ -67,38 +69,121 @@ public class StripedBlockChecksumReconstructor extends StripedReconstructor {
     checksumBuf = new byte[tmpLen];
   }
 
+  @Override
   public void reconstruct() throws IOException {
-    MessageDigest digester = MD5Hash.getDigester();
-    while (getPositionInBlock() < getMaxTargetLength()) {
-      long remaining = getMaxTargetLength() - getPositionInBlock();
-      final int toReconstructLen = (int) Math
-          .min(getStripedReader().getBufferSize(), remaining);
-      // step1: read from minimum source DNs required for reconstruction.
-      // The returned success list is the source DNs we do real read from
-      getStripedReader().readMinimumSources(toReconstructLen);
+    prepareDigester();
+    long maxTargetLength = getMaxTargetLength();
+    try {
+      while (requestedLen > 0 && getPositionInBlock() < maxTargetLength) {
+        long remaining = maxTargetLength - getPositionInBlock();
+        final int toReconstructLen = (int) Math
+            .min(getStripedReader().getBufferSize(), remaining);
+        // step1: read from minimum source DNs required for reconstruction.
+        // The returned success list is the source DNs we do real read from
+        getStripedReader().readMinimumSources(toReconstructLen);
 
-      // step2: decode to reconstruct targets
-      reconstructTargets(toReconstructLen);
+        // step2: decode to reconstruct targets
+        reconstructTargets(toReconstructLen);
 
-      // step3: calculate checksum
-      getChecksum().calculateChunkedSums(targetBuffer.array(), 0,
-          targetBuffer.remaining(), checksumBuf, 0);
+        // step3: calculate checksum
+        checksumDataLen += checksumWithTargetOutput(
+            targetBuffer.array(), toReconstructLen);
 
-      // step4: updates the digest using the checksum array of bytes
-      digester.update(checksumBuf, 0, checksumBuf.length);
-      checksumDataLen += checksumBuf.length;
-      updatePositionInBlock(toReconstructLen);
-      clearBuffers();
+        updatePositionInBlock(toReconstructLen);
+        requestedLen -= toReconstructLen;
+        clearBuffers();
+      }
+
+      commitDigest();
+    } finally {
+      cleanup();
     }
-
-    byte[] digest = digester.digest();
-    md5 = new MD5Hash(digest);
-    md5.write(checksumWriter);
   }
 
-  private void reconstructTargets(int toReconstructLen) {
-    initDecoderIfNecessary();
+  /**
+   * Should return a representation of a completed/reconstructed digest which
+   * is suitable for debug printing.
+   */
+  public abstract Object getDigestObject();
 
+  /**
+   * This will be called before starting reconstruction.
+   */
+  abstract void prepareDigester() throws IOException;
+
+  /**
+   * This will be called repeatedly with chunked checksums computed in-flight
+   * over reconstructed data.
+   *
+   * @param dataBytesPerChecksum the number of underlying data bytes
+   *     corresponding to each checksum inside {@code checksumBytes}.
+   */
+  abstract void updateDigester(byte[] checksumBytes, int dataBytesPerChecksum)
+      throws IOException;
+
+  /**
+   * This will be called when reconstruction of entire requested length is
+   * complete and any final digests should be committed to
+   * implementation-specific output fields.
+   */
+  abstract void commitDigest() throws IOException;
+
+  protected DataOutputBuffer getChecksumWriter() {
+    return checksumWriter;
+  }
+
+  private long checksumWithTargetOutput(byte[] outputData, int toReconstructLen)
+      throws IOException {
+    long checksumDataLength = 0;
+    // Calculate partial block checksum. There are two cases.
+    // case-1) length of data bytes which is fraction of bytesPerCRC
+    // case-2) length of data bytes which is less than bytesPerCRC
+    if (requestedLen <= toReconstructLen) {
+      int remainingLen = Math.toIntExact(requestedLen);
+      outputData = Arrays.copyOf(targetBuffer.array(), remainingLen);
+
+      int partialLength = remainingLen % getChecksum().getBytesPerChecksum();
+
+      int checksumRemaining = (remainingLen
+          / getChecksum().getBytesPerChecksum())
+          * getChecksum().getChecksumSize();
+
+      int dataOffset = 0;
+
+      // case-1) length of data bytes which is fraction of bytesPerCRC
+      if (checksumRemaining > 0) {
+        remainingLen = remainingLen - partialLength;
+        checksumBuf = new byte[checksumRemaining];
+        getChecksum().calculateChunkedSums(outputData, dataOffset,
+            remainingLen, checksumBuf, 0);
+        updateDigester(checksumBuf, getChecksum().getBytesPerChecksum());
+        checksumDataLength = checksumBuf.length;
+        dataOffset = remainingLen;
+      }
+
+      // case-2) length of data bytes which is less than bytesPerCRC
+      if (partialLength > 0) {
+        byte[] partialCrc = new byte[getChecksum().getChecksumSize()];
+        getChecksum().reset();
+        getChecksum().update(outputData, dataOffset, partialLength);
+        getChecksum().writeValue(partialCrc, 0, true);
+        updateDigester(partialCrc, partialLength);
+        checksumDataLength += partialCrc.length;
+      }
+
+      clearBuffers();
+      // calculated checksum for the requested length, return checksum length.
+      return checksumDataLength;
+    }
+    getChecksum().calculateChunkedSums(outputData, 0,
+        outputData.length, checksumBuf, 0);
+
+    // updates digest using the checksum array of bytes
+    updateDigester(checksumBuf, getChecksum().getBytesPerChecksum());
+    return checksumBuf.length;
+  }
+
+  private void reconstructTargets(int toReconstructLen) throws IOException {
     ByteBuffer[] inputs = getStripedReader().getInputBuffers(toReconstructLen);
 
     ByteBuffer[] outputs = new ByteBuffer[1];
@@ -117,10 +202,6 @@ public class StripedBlockChecksumReconstructor extends StripedReconstructor {
   private void clearBuffers() {
     getStripedReader().clearBuffers();
     targetBuffer.clear();
-  }
-
-  public MD5Hash getMD5() {
-    return md5;
   }
 
   public long getChecksumDataLen() {

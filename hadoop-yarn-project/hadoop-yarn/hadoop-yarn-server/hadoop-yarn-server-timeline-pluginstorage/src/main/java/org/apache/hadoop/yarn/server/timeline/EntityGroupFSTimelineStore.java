@@ -17,8 +17,15 @@
 
 package org.apache.hadoop.yarn.server.timeline;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.databind.MappingJsonFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.type.TypeFactory;
+import com.fasterxml.jackson.module.jaxb.JaxbAnnotationIntrospector;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import org.apache.commons.lang3.mutable.MutableBoolean;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -29,6 +36,7 @@ import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.service.CompositeService;
 import org.apache.hadoop.service.ServiceOperations;
 import org.apache.hadoop.ipc.CallerContext;
+import org.apache.hadoop.util.ApplicationClassLoader;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
@@ -48,17 +56,17 @@ import org.apache.hadoop.yarn.exceptions.ApplicationNotFoundException;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.timeline.TimelineDataManager.CheckAcl;
 import org.apache.hadoop.yarn.server.timeline.security.TimelineACLsManager;
-import org.apache.hadoop.yarn.util.ConverterUtils;
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.map.MappingJsonFactory;
-import org.codehaus.jackson.map.ObjectMapper;
-import org.codehaus.jackson.xc.JaxbAnnotationIntrospector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.lang.reflect.UndeclaredThrowableException;
+import java.net.MalformedURLException;
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -176,15 +184,8 @@ public class EntityGroupFSTimelineStore extends CompositeService
               TimelineEntityGroupId groupId = eldest.getKey();
               LOG.debug("Evicting {} due to space limitations", groupId);
               EntityCacheItem cacheItem = eldest.getValue();
-              int activeStores = EntityCacheItem.getActiveStores();
-              if (activeStores > appCacheMaxSize * CACHE_ITEM_OVERFLOW_FACTOR) {
-                LOG.debug("Force release cache {} since {} stores are active",
-                    groupId, activeStores);
-                cacheItem.forceRelease();
-              } else {
-                LOG.debug("Try release cache {}", groupId);
-                cacheItem.tryRelease();
-              }
+              LOG.debug("Force release cache {}.", groupId);
+              cacheItem.forceRelease();
               if (cacheItem.getAppLogs().isDone()) {
                 appIdLogMap.remove(groupId.getApplicationId());
               }
@@ -217,25 +218,46 @@ public class EntityGroupFSTimelineStore extends CompositeService
       throws RuntimeException {
     Collection<String> pluginNames = conf.getTrimmedStringCollection(
         YarnConfiguration.TIMELINE_SERVICE_ENTITY_GROUP_PLUGIN_CLASSES);
+
+    String pluginClasspath = conf.getTrimmed(
+        YarnConfiguration.TIMELINE_SERVICE_ENTITY_GROUP_PLUGIN_CLASSPATH);
+    String[] systemClasses = conf.getTrimmedStrings(
+        YarnConfiguration.TIMELINE_SERVICE_ENTITY_GROUP_PLUGIN_SYSTEM_CLASSES);
+
     List<TimelineEntityGroupPlugin> pluginList
         = new LinkedList<TimelineEntityGroupPlugin>();
-    Exception caught = null;
+    ClassLoader customClassLoader = null;
+    if (pluginClasspath != null && pluginClasspath.length() > 0) {
+      try {
+        customClassLoader = createPluginClassLoader(pluginClasspath,
+            systemClasses);
+      } catch (IOException ioe) {
+        LOG.warn("Error loading classloader", ioe);
+      }
+    }
     for (final String name : pluginNames) {
       LOG.debug("Trying to load plugin class {}", name);
       TimelineEntityGroupPlugin cacheIdPlugin = null;
+
       try {
-        Class<?> clazz = conf.getClassByName(name);
-        cacheIdPlugin =
-            (TimelineEntityGroupPlugin) ReflectionUtils.newInstance(
-                clazz, conf);
+        if (customClassLoader != null) {
+          LOG.debug("Load plugin {} with classpath: {}", name, pluginClasspath);
+          Class<?> clazz = Class.forName(name, true, customClassLoader);
+          Class<? extends TimelineEntityGroupPlugin> sClass = clazz.asSubclass(
+              TimelineEntityGroupPlugin.class);
+          cacheIdPlugin = ReflectionUtils.newInstance(sClass, conf);
+        } else {
+          LOG.debug("Load plugin class with system classpath");
+          Class<?> clazz = conf.getClassByName(name);
+          cacheIdPlugin =
+              (TimelineEntityGroupPlugin) ReflectionUtils.newInstance(
+                  clazz, conf);
+        }
       } catch (Exception e) {
         LOG.warn("Error loading plugin " + name, e);
-        caught = e;
+        throw new RuntimeException("No class defined for " + name, e);
       }
 
-      if (cacheIdPlugin == null) {
-        throw new RuntimeException("No class defined for " + name, caught);
-      }
       LOG.info("Load plugin class {}", cacheIdPlugin.getClass().getName());
       pluginList.add(cacheIdPlugin);
     }
@@ -274,7 +296,8 @@ public class EntityGroupFSTimelineStore extends CompositeService
     }
 
     objMapper = new ObjectMapper();
-    objMapper.setAnnotationIntrospector(new JaxbAnnotationIntrospector());
+    objMapper.setAnnotationIntrospector(
+        new JaxbAnnotationIntrospector(TypeFactory.defaultInstance()));
     jsonFactory = new MappingJsonFactory(objMapper);
     final long scanIntervalSecs = conf.getLong(
         YarnConfiguration
@@ -335,7 +358,13 @@ public class EntityGroupFSTimelineStore extends CompositeService
   @VisibleForTesting
   int scanActiveLogs() throws IOException {
     long startTime = Time.monotonicNow();
-    RemoteIterator<FileStatus> iter = list(activeRootPath);
+    int logsToScanCount = scanActiveLogs(activeRootPath);
+    metrics.addActiveLogDirScanTime(Time.monotonicNow() - startTime);
+    return logsToScanCount;
+  }
+
+  int scanActiveLogs(Path dir) throws IOException {
+    RemoteIterator<FileStatus> iter = list(dir);
     int logsToScanCount = 0;
     while (iter.hasNext()) {
       FileStatus stat = iter.next();
@@ -347,10 +376,9 @@ public class EntityGroupFSTimelineStore extends CompositeService
         AppLogs logs = getAndSetActiveLog(appId, stat.getPath());
         executor.execute(new ActiveLogParser(logs));
       } else {
-        LOG.debug("Unable to parse entry {}", name);
+        logsToScanCount += scanActiveLogs(stat.getPath());
       }
     }
-    metrics.addActiveLogDirScanTime(Time.monotonicNow() - startTime);
     return logsToScanCount;
   }
 
@@ -397,6 +425,18 @@ public class EntityGroupFSTimelineStore extends CompositeService
         appDirPath = getActiveAppPath(applicationId);
         if (fs.exists(appDirPath)) {
           appState = AppState.ACTIVE;
+        } else {
+          // check for user directory inside active path
+          RemoteIterator<FileStatus> iter = list(activeRootPath);
+          while (iter.hasNext()) {
+            Path child = new Path(iter.next().getPath().getName(),
+                applicationId.toString());
+            appDirPath = new Path(activeRootPath, child);
+            if (fs.exists(appDirPath)) {
+              appState = AppState.ACTIVE;
+              break;
+            }
+          }
         }
       }
       if (appState != AppState.UNKNOWN) {
@@ -418,42 +458,75 @@ public class EntityGroupFSTimelineStore extends CompositeService
    *                dirpath should be a directory that contains a set of
    *                application log directories. The cleaner method will not
    *                work if the given dirpath itself is an application log dir.
-   * @param fs
    * @param retainMillis
    * @throws IOException
    */
   @InterfaceAudience.Private
   @VisibleForTesting
-  void cleanLogs(Path dirpath, FileSystem fs, long retainMillis)
+  void cleanLogs(Path dirpath, long retainMillis)
       throws IOException {
+    long now = Time.now();
+    RemoteIterator<FileStatus> iter = list(dirpath);
+    while (iter.hasNext()) {
+      FileStatus stat = iter.next();
+      Path clusterTimeStampPath = stat.getPath();
+      if (isValidClusterTimeStampDir(clusterTimeStampPath)) {
+        MutableBoolean appLogDirPresent = new MutableBoolean(false);
+        cleanAppLogDir(clusterTimeStampPath, retainMillis, appLogDirPresent);
+        if (appLogDirPresent.isFalse() &&
+            (now - stat.getModificationTime() > retainMillis)) {
+          deleteDir(clusterTimeStampPath);
+        }
+      }
+    }
+  }
+
+
+  private void cleanAppLogDir(Path dirpath, long retainMillis,
+      MutableBoolean appLogDirPresent) throws IOException {
     long now = Time.now();
     // Depth first search from root directory for all application log dirs
     RemoteIterator<FileStatus> iter = list(dirpath);
     while (iter.hasNext()) {
       FileStatus stat = iter.next();
+      Path childPath = stat.getPath();
       if (stat.isDirectory()) {
         // If current is an application log dir, decide if we need to remove it
         // and remove if necessary.
         // Otherwise, keep iterating into it.
-        ApplicationId appId = parseApplicationId(dirpath.getName());
+        ApplicationId appId = parseApplicationId(childPath.getName());
         if (appId != null) { // Application log dir
-          if (shouldCleanAppLogDir(dirpath, now, fs, retainMillis)) {
-            try {
-              LOG.info("Deleting {}", dirpath);
-              if (!fs.delete(dirpath, true)) {
-                LOG.error("Unable to remove " + dirpath);
-              }
-              metrics.incrLogsDirsCleaned();
-            } catch (IOException e) {
-              LOG.error("Unable to remove " + dirpath, e);
-            }
+          appLogDirPresent.setTrue();
+          if (shouldCleanAppLogDir(childPath, now, fs, retainMillis)) {
+            deleteDir(childPath);
           }
         } else { // Keep cleaning inside
-          cleanLogs(stat.getPath(), fs, retainMillis);
+          cleanAppLogDir(childPath, retainMillis, appLogDirPresent);
         }
       }
     }
   }
+
+  private void deleteDir(Path path) {
+    try {
+      LOG.info("Deleting {}", path);
+      if (fs.delete(path, true)) {
+        metrics.incrLogsDirsCleaned();
+      } else {
+        LOG.error("Unable to remove {}", path);
+      }
+    } catch (IOException e) {
+      LOG.error("Unable to remove {}", path, e);
+    }
+  }
+
+  private boolean isValidClusterTimeStampDir(Path clusterTimeStampPath)
+      throws IOException {
+    FileStatus stat = fs.getFileStatus(clusterTimeStampPath);
+    return stat.isDirectory() &&
+        StringUtils.isNumeric(clusterTimeStampPath.getName());
+  }
+
 
   private static boolean shouldCleanAppLogDir(Path appLogPath, long now,
       FileSystem fs, long logRetainMillis) throws IOException {
@@ -481,12 +554,35 @@ public class EntityGroupFSTimelineStore extends CompositeService
     ApplicationId appId = null;
     if (appIdStr.startsWith(ApplicationId.appIdStrPrefix)) {
       try {
-        appId = ConverterUtils.toApplicationId(appIdStr);
+        appId = ApplicationId.fromString(appIdStr);
       } catch (IllegalArgumentException e) {
         appId = null;
       }
     }
     return appId;
+  }
+
+  private static ClassLoader createPluginClassLoader(
+      final String appClasspath, final String[] systemClasses)
+      throws IOException {
+    try {
+      return AccessController.doPrivileged(
+        new PrivilegedExceptionAction<ClassLoader>() {
+          @Override
+          public ClassLoader run() throws MalformedURLException {
+            return new ApplicationClassLoader(appClasspath,
+                EntityGroupFSTimelineStore.class.getClassLoader(),
+                Arrays.asList(systemClasses));
+          }
+        }
+      );
+    } catch (PrivilegedActionException e) {
+      Throwable t = e.getCause();
+      if (t instanceof MalformedURLException) {
+        throw (MalformedURLException) t;
+      }
+      throw new IOException(e);
+    }
   }
 
   private Path getActiveAppPath(ApplicationId appId) {
@@ -529,6 +625,15 @@ public class EntityGroupFSTimelineStore extends CompositeService
   @VisibleForTesting
   protected AppState getAppState(ApplicationId appId) throws IOException {
     return getAppState(appId, yarnClient);
+  }
+
+  /**
+   * Get all plugins for tests.
+   * @return all plugins
+   */
+  @VisibleForTesting
+  List<TimelineEntityGroupPlugin> getPlugins() {
+    return cacheIdPlugins;
   }
 
   /**
@@ -716,8 +821,8 @@ public class EntityGroupFSTimelineStore extends CompositeService
       summaryLogs.add(log);
     }
 
-    private void addDetailLog(String attemptDirName, String filename,
-        String owner) {
+    private synchronized void addDetailLog(String attemptDirName,
+        String filename, String owner) {
       for (LogInfo log : detailLogs) {
         if (log.getFilename().equals(filename)
             && log.getAttemptDirName().equals(attemptDirName)) {
@@ -725,6 +830,30 @@ public class EntityGroupFSTimelineStore extends CompositeService
         }
       }
       detailLogs.add(new EntityLogInfo(attemptDirName, filename, owner));
+    }
+
+    synchronized void loadDetailLog(TimelineDataManager tdm,
+        TimelineEntityGroupId groupId) throws IOException {
+      List<LogInfo> removeList = new ArrayList<>();
+      for (LogInfo log : detailLogs) {
+        LOG.debug("Try refresh logs for {}", log.getFilename());
+        // Only refresh the log that matches the cache id
+        if (log.matchesGroupId(groupId)) {
+          Path dirPath = getAppDirPath();
+          if (fs.exists(log.getPath(dirPath))) {
+            LOG.debug("Refresh logs for cache id {}", groupId);
+            log.parseForStore(tdm, dirPath, isDone(),
+                jsonFactory, objMapper, fs);
+          } else {
+            // The log may have been removed, remove the log
+            removeList.add(log);
+            LOG.info(
+                "File {} no longer exists, removing it from log list",
+                log.getPath(dirPath));
+          }
+        }
+      }
+      detailLogs.removeAll(removeList);
     }
 
     public synchronized void moveToDone() throws IOException {
@@ -814,7 +943,7 @@ public class EntityGroupFSTimelineStore extends CompositeService
       LOG.debug("Cleaner starting");
       long startTime = Time.monotonicNow();
       try {
-        cleanLogs(doneRootPath, fs, logRetainMillis);
+        cleanLogs(doneRootPath, logRetainMillis);
       } catch (Exception e) {
         Throwable t = extract(e);
         if (t instanceof InterruptedException) {
@@ -838,7 +967,6 @@ public class EntityGroupFSTimelineStore extends CompositeService
   @InterfaceAudience.Private
   @VisibleForTesting
   void setCachedLogs(TimelineEntityGroupId groupId, EntityCacheItem cacheItem) {
-    cacheItem.incrRefs();
     cachedLogs.put(groupId, cacheItem);
   }
 
@@ -915,14 +1043,12 @@ public class EntityGroupFSTimelineStore extends CompositeService
       cacheItem = this.cachedLogs.get(groupId);
       if (cacheItem == null) {
         LOG.debug("Set up new cache item for id {}", groupId);
-        cacheItem = new EntityCacheItem(groupId, getConfig(), fs);
+        cacheItem = new EntityCacheItem(groupId, getConfig());
         AppLogs appLogs = getAndSetAppLogs(groupId.getApplicationId());
         if (appLogs != null) {
           LOG.debug("Set applogs {} for group id {}", appLogs, groupId);
           cacheItem.setAppLogs(appLogs);
           this.cachedLogs.put(groupId, cacheItem);
-          // Add the reference by the cache
-          cacheItem.incrRefs();
         } else {
           LOG.warn("AppLogs for groupId {} is set to null!", groupId);
         }
@@ -932,21 +1058,12 @@ public class EntityGroupFSTimelineStore extends CompositeService
     if (cacheItem.getAppLogs() != null) {
       AppLogs appLogs = cacheItem.getAppLogs();
       LOG.debug("try refresh cache {} {}", groupId, appLogs.getAppId());
-      // Add the reference by the store
-      cacheItem.incrRefs();
       cacheItems.add(cacheItem);
-      store = cacheItem.refreshCache(aclManager, jsonFactory, objMapper,
-          metrics);
+      store = cacheItem.refreshCache(aclManager, metrics);
     } else {
       LOG.warn("AppLogs for group id {} is null", groupId);
     }
     return store;
-  }
-
-  protected void tryReleaseCacheItems(List<EntityCacheItem> relatedCacheItems) {
-    for (EntityCacheItem item : relatedCacheItems) {
-      item.tryRelease();
-    }
   }
 
   @Override
@@ -968,7 +1085,6 @@ public class EntityGroupFSTimelineStore extends CompositeService
         returnEntities.addEntities(entities.getEntities());
       }
     }
-    tryReleaseCacheItems(relatedCacheItems);
     return returnEntities;
   }
 
@@ -985,12 +1101,10 @@ public class EntityGroupFSTimelineStore extends CompositeService
       TimelineEntity e =
           store.getEntity(entityId, entityType, fieldsToRetrieve);
       if (e != null) {
-        tryReleaseCacheItems(relatedCacheItems);
         return e;
       }
     }
     LOG.debug("getEntity: Found nothing");
-    tryReleaseCacheItems(relatedCacheItems);
     return null;
   }
 
@@ -1001,6 +1115,11 @@ public class EntityGroupFSTimelineStore extends CompositeService
     LOG.debug("getEntityTimelines type={} ids={}", entityType, entityIds);
     TimelineEvents returnEvents = new TimelineEvents();
     List<EntityCacheItem> relatedCacheItems = new ArrayList<>();
+
+    if (entityIds == null || entityIds.isEmpty()) {
+      return returnEvents;
+    }
+
     for (String entityId : entityIds) {
       LOG.debug("getEntityTimeline type={} id={}", entityType, entityId);
       List<TimelineStore> stores
@@ -1018,7 +1137,6 @@ public class EntityGroupFSTimelineStore extends CompositeService
         }
       }
     }
-    tryReleaseCacheItems(relatedCacheItems);
     return returnEvents;
   }
 

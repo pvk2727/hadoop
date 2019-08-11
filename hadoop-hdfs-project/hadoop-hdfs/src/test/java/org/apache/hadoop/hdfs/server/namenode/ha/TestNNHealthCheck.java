@@ -19,8 +19,10 @@ package org.apache.hadoop.hdfs.server.namenode.ha;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeys.HA_HM_RPC_TIMEOUT_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeys.HA_HM_RPC_TIMEOUT_KEY;
+import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE;
 import static org.apache.hadoop.hdfs.DFSConfigKeys.DFS_NAMENODE_LIFELINE_RPC_ADDRESS_KEY;
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.IOException;
 
@@ -30,14 +32,15 @@ import org.apache.hadoop.ha.HealthCheckFailedException;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.MiniDFSNNTopology;
-import org.apache.hadoop.hdfs.server.namenode.NameNodeResourceChecker;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.server.namenode.MockNameNodeResourceChecker;
 import org.apache.hadoop.hdfs.tools.NNHAServiceTarget;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.test.LambdaTestUtils;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.Mockito;
 
 public class TestNNHealthCheck {
 
@@ -76,10 +79,36 @@ public class TestNNHealthCheck {
     doNNHealthCheckTest();
   }
 
+  @Test
+  public void testNNHealthCheckWithSafemodeAsUnhealthy() throws Exception {
+    conf.setBoolean(DFS_HA_NN_NOT_BECOME_ACTIVE_IN_SAFEMODE, true);
+
+    // now bring up just the NameNode.
+    cluster = new MiniDFSCluster.Builder(conf).numDataNodes(0)
+        .nnTopology(MiniDFSNNTopology.simpleHATopology()).build();
+    cluster.waitActive();
+
+    // manually set safemode.
+    cluster.getFileSystem(0)
+        .setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_ENTER);
+
+    NNHAServiceTarget haTarget = new NNHAServiceTarget(conf,
+        DFSUtil.getNamenodeNameServiceId(conf), "nn1");
+    final String expectedTargetString = haTarget.getAddress().toString();
+
+    assertTrue("Expected haTarget " + haTarget + " containing " +
+            expectedTargetString,
+        haTarget.toString().contains(expectedTargetString));
+    HAServiceProtocol rpc = haTarget.getHealthMonitorProxy(conf, 5000);
+
+    LambdaTestUtils.intercept(RemoteException.class,
+        "The NameNode is configured to report UNHEALTHY to ZKFC in Safemode.",
+        () -> rpc.monitorHealth());
+  }
+
   private void doNNHealthCheckTest() throws IOException {
-    NameNodeResourceChecker mockResourceChecker = Mockito.mock(
-        NameNodeResourceChecker.class);
-    Mockito.doReturn(true).when(mockResourceChecker).hasAvailableDiskSpace();
+    MockNameNodeResourceChecker mockResourceChecker =
+        new MockNameNodeResourceChecker(conf);
     cluster.getNameNode(0).getNamesystem()
         .setNNResourceChecker(mockResourceChecker);
 
@@ -101,7 +130,7 @@ public class TestNNHealthCheck {
     // Should not throw error, which indicates healthy.
     rpc.monitorHealth();
 
-    Mockito.doReturn(false).when(mockResourceChecker).hasAvailableDiskSpace();
+    mockResourceChecker.setResourcesAvailable(false);
 
     try {
       // Should throw error - NN is unhealthy.

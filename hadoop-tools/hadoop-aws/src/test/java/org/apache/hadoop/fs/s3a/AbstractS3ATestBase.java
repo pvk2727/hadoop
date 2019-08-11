@@ -26,13 +26,14 @@ import org.apache.hadoop.fs.contract.ContractTestUtils;
 import org.apache.hadoop.fs.contract.s3a.S3AContract;
 import org.apache.hadoop.io.IOUtils;
 import org.junit.Before;
-import org.junit.Rule;
-import org.junit.rules.TestName;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 
 import static org.apache.hadoop.fs.contract.ContractTestUtils.dataset;
 import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
+import static org.apache.hadoop.fs.s3a.S3ATestUtils.getTestDynamoTablePrefix;
 
 /**
  * An extension of the contract test base set up for S3A tests.
@@ -40,23 +41,49 @@ import static org.apache.hadoop.fs.contract.ContractTestUtils.writeDataset;
 public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
     implements S3ATestConstants {
 
+  protected static final Logger LOG =
+      LoggerFactory.getLogger(AbstractS3ATestBase.class);
+
   @Override
   protected AbstractFSContract createContract(Configuration conf) {
     return new S3AContract(conf);
   }
 
   @Override
+  public void setup() throws Exception {
+    Thread.currentThread().setName("setup");
+    super.setup();
+  }
+
+  @Override
   public void teardown() throws Exception {
+    Thread.currentThread().setName("teardown");
     super.teardown();
+    describe("closing file system");
     IOUtils.closeStream(getFileSystem());
   }
 
-  @Rule
-  public TestName methodName = new TestName();
-
   @Before
   public void nameThread() {
-    Thread.currentThread().setName("JUnit-" + methodName.getMethodName());
+    Thread.currentThread().setName("JUnit-" + getMethodName());
+  }
+
+  protected String getMethodName() {
+    return methodName.getMethodName();
+  }
+
+  @Override
+  protected int getTestTimeoutMillis() {
+    return S3A_TEST_TIMEOUT;
+  }
+
+  /**
+   * Create a configuration, possibly patching in S3Guard options.
+   * @return a configuration
+   */
+  @Override
+  protected Configuration createConfiguration() {
+    return S3ATestUtils.prepareTestConfiguration(super.createConfiguration());
   }
 
   protected Configuration getConfiguration() {
@@ -73,6 +100,17 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
   }
 
   /**
+   * Describe a test in the logs.
+   * @param text text to print
+   * @param args arguments to format in the printing
+   */
+  protected void describe(String text, Object... args) {
+    LOG.info("\n\n{}: {}\n",
+        getMethodName(),
+        String.format(text, args));
+  }
+
+  /**
    * Write a file, read it back, validate the dataset. Overwrites the file
    * if it is present
    * @param name filename (will have the test path prepended to it)
@@ -82,20 +120,35 @@ public abstract class AbstractS3ATestBase extends AbstractFSContractTestBase
    */
   protected Path writeThenReadFile(String name, int len) throws IOException {
     Path path = path(name);
+    writeThenReadFile(path, len);
+    return path;
+  }
+
+  /**
+   * Write a file, read it back, validate the dataset. Overwrites the file
+   * if it is present
+   * @param path path to file
+   * @param len length of file
+   * @throws IOException any IO problem
+   */
+  protected void writeThenReadFile(Path path, int len) throws IOException {
     byte[] data = dataset(len, 'a', 'z');
     writeDataset(getFileSystem(), path, data, data.length, 1024 * 1024, true);
     ContractTestUtils.verifyFileContents(getFileSystem(), path, data);
-    return path;
+  }
+
+  protected String getTestTableName(String suffix) {
+    return getTestDynamoTablePrefix(getConfiguration()) + suffix;
   }
 
   /**
    * Assert that an exception failed with a specific status code.
    * @param e exception
    * @param code expected status code
-   * @throws AWSS3IOException rethrown if the status code does not match.
+   * @throws AWSServiceIOException rethrown if the status code does not match.
    */
-  protected void assertStatusCode(AWSS3IOException e, int code)
-      throws AWSS3IOException {
+  protected void assertStatusCode(AWSServiceIOException e, int code)
+      throws AWSServiceIOException {
     if (e.getStatusCode() != code) {
       throw e;
     }

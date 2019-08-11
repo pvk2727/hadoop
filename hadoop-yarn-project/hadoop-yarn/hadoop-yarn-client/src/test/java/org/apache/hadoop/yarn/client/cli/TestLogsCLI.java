@@ -18,11 +18,17 @@
 
 package org.apache.hadoop.yarn.client.cli;
 
+import static org.apache.hadoop.yarn.conf.YarnConfiguration.LOG_AGGREGATION_FILE_CONTROLLER_FMT;
+import static org.apache.hadoop.yarn.conf.YarnConfiguration.LOG_AGGREGATION_REMOTE_APP_LOG_DIR_FMT;
+import static org.apache.hadoop.yarn.conf.YarnConfiguration.LOG_AGGREGATION_REMOTE_APP_LOG_DIR_SUFFIX_FMT;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.doNothing;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -30,10 +36,13 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+import com.sun.jersey.api.client.Client;
+import com.sun.jersey.api.client.ClientResponse;
+import com.sun.jersey.api.client.ClientResponse.Status;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -47,7 +56,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -62,6 +73,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationReport;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.client.api.YarnClient;
@@ -71,9 +83,16 @@ import org.apache.hadoop.yarn.logaggregation.AggregatedLogFormat;
 import org.apache.hadoop.yarn.logaggregation.ContainerLogsRequest;
 import org.apache.hadoop.yarn.logaggregation.LogAggregationUtils;
 import org.apache.hadoop.yarn.logaggregation.LogCLIHelpers;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileController;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileControllerContext;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileControllerFactory;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.ifile.LogAggregationIndexedFileController;
+import org.codehaus.jettison.json.JSONArray;
+import org.codehaus.jettison.json.JSONObject;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.ArgumentCaptor;
 
 public class TestLogsCLI {
 
@@ -117,6 +136,21 @@ public class TestLogsCLI {
     assertTrue("Should return an error code", exitCode != 0);
   }
 
+  @Test(timeout = 10000l)
+  public void testInvalidOpts() throws Exception {
+    Configuration conf = new YarnConfiguration();
+    YarnClient mockYarnClient = createMockYarnClient(
+        YarnApplicationState.FINISHED,
+        UserGroupInformation.getCurrentUser().getShortUserName());
+    LogsCLI cli = new LogsCLIForTest(mockYarnClient);
+    cli.setConf(conf);
+
+    int exitCode = cli.run( new String[] { "-InvalidOpts"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains(
+        "options parsing failed: Unrecognized option: -InvalidOpts"));
+  }
+
   @Test(timeout = 5000l)
   public void testInvalidApplicationId() throws Exception {
     Configuration conf = new YarnConfiguration();
@@ -129,6 +163,64 @@ public class TestLogsCLI {
     int exitCode = cli.run( new String[] { "-applicationId", "not_an_app_id"});
     assertTrue(exitCode == -1);
     assertTrue(sysErrStream.toString().startsWith("Invalid ApplicationId specified"));
+  }
+
+  @Test(timeout = 5000L)
+  public void testInvalidAMContainerId() throws Exception {
+    Configuration conf = new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.APPLICATION_HISTORY_ENABLED, true);
+    YarnClient mockYarnClient =
+        createMockYarnClient(YarnApplicationState.FINISHED,
+            UserGroupInformation.getCurrentUser().getShortUserName());
+    LogsCLI cli = spy(new LogsCLIForTest(mockYarnClient));
+    List<JSONObject> list = Arrays.asList(new JSONObject());
+    doReturn(list).when(cli)
+        .getAMContainerInfoForRMWebService(any(Configuration.class),
+            any(String.class));
+    cli.setConf(conf);
+
+    int exitCode = cli.run(
+        new String[] {"-applicationId", "application_1465862913885_0027",
+            "-am", "1000" });
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString()
+        .contains("exceeds the number of AM containers"));
+  }
+
+  @Test
+  public void testAMContainerInfoFetchFromTimelineReader() throws Exception {
+    Configuration conf = new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.TIMELINE_SERVICE_ENABLED, true);
+    conf.set(YarnConfiguration.TIMELINE_SERVICE_VERSIONS, "2.0f");
+    YarnClient mockYarnClient =
+        createMockYarnClient(YarnApplicationState.FINISHED,
+            UserGroupInformation.getCurrentUser().getShortUserName());
+    LogsCLI cli = spy(new LogsCLIForTest(mockYarnClient));
+
+    String appInfoEntity =
+        "[{\"metrics\":[],\"events\":[],\"createdtime\":1542273848613,\"idpref"
+            + "ix\":9223372036854775806,\"id\":\"appattempt_1542271570060_0002_"
+            + "000001\",\"type\":\"YARN_APPLICATION_ATTEMPT\",\"info\":{\"YARN_"
+            + "APPLICATION_ATTEMPT_MASTER_CONTAINER\":\"container_e01_154227157"
+            + "0060_0002_01_000001\"},\"configs\":{},\"isrelatedto\":{},\"relat"
+            + "esto\":{}}]";
+    JSONArray obj = new JSONArray(appInfoEntity);
+
+    ClientResponse response = mock(ClientResponse.class);
+    doReturn(obj).when(response).getEntity(JSONArray.class);
+
+    doReturn(response).when(cli)
+        .getClientResponseFromTimelineReader(any(Configuration.class),
+            any(String.class));
+    doThrow(new RuntimeException()).when(cli)
+        .getAMContainerInfoForRMWebService(any(Configuration.class),
+            any(String.class));
+
+    cli.setConf(conf);
+    int exitCode = cli.run(
+        new String[] {"-applicationId", "application_1542271570060_0002",
+            "-am", "1" });
+    assertTrue(exitCode == 0);
   }
 
   @Test(timeout = 5000l)
@@ -147,7 +239,7 @@ public class TestLogsCLI {
         "Unable to get ApplicationState"));
   }
 
-  @Test(timeout = 5000l)
+  @Test (timeout = 10000)
   public void testHelpMessage() throws Exception {
     Configuration conf = new YarnConfiguration();
     YarnClient mockYarnClient = createMockYarnClient(
@@ -158,65 +250,122 @@ public class TestLogsCLI {
 
     int exitCode = dumper.run(new String[]{});
     assertTrue(exitCode == -1);
+
     ByteArrayOutputStream baos = new ByteArrayOutputStream();
     PrintWriter pw = new PrintWriter(baos);
-    pw.println("Retrieve logs for completed YARN applications.");
+    pw.println("Retrieve logs for YARN applications.");
     pw.println("usage: yarn logs -applicationId <application ID> [OPTIONS]");
     pw.println();
     pw.println("general options are:");
-    pw.println(" -am <AM Containers>             Prints the AM Container logs for this");
-    pw.println("                                 application. Specify comma-separated");
-    pw.println("                                 value to get logs for related AM");
-    pw.println("                                 Container. For example, If we specify -am");
-    pw.println("                                 1,2, we will get the logs for the first");
-    pw.println("                                 AM Container as well as the second AM");
-    pw.println("                                 Container. To get logs for all AM");
-    pw.println("                                 Containers, use -am ALL. To get logs for");
-    pw.println("                                 the latest AM Container, use -am -1. By");
-    pw.println("                                 default, it will only print out syslog.");
-    pw.println("                                 Work with -logFiles to get other logs");
-    pw.println(" -appOwner <Application Owner>   AppOwner (assumed to be current user if");
-    pw.println("                                 not specified)");
-    pw.println(" -containerId <Container ID>     ContainerId. By default, it will only");
-    pw.println("                                 print syslog if the application is");
-    pw.println("                                 runing. Work with -logFiles to get other");
-    pw.println("                                 logs.");
-    pw.println(" -help                           Displays help for all commands.");
-    pw.println(" -list_nodes                     Show the list of nodes that successfully");
-    pw.println("                                 aggregated logs. This option can only be");
-    pw.println("                                 used with finished applications.");
-    pw.println(" -logFiles <Log File Name>       Work with -am/-containerId and specify");
-    pw.println("                                 comma-separated value to get specified");
-    pw.println("                                 container log files. Use \"ALL\" to fetch");
-    pw.println("                                 all the log files for the container. It");
-    pw.println("                                 also supports Java Regex.");
-    pw.println(" -nodeAddress <Node Address>     NodeAddress in the format nodename:port");
-    pw.println(" -out <Local Directory>          Local directory for storing individual");
-    pw.println("                                 container logs. The container logs will");
-    pw.println("                                 be stored based on the node the container");
-    pw.println("                                 ran on.");
-    pw.println(" -show_meta_info                 Show the log metadata, including log-file");
-    pw.println("                                 names, the size of the log files. You can");
-    pw.println("                                 combine this with --containerId to get");
-    pw.println("                                 log metadata for the specific container,");
-    pw.println("                                 or with --nodeAddress to get log metadata");
-    pw.println("                                 for all the containers on the specific");
-    pw.println("                                 NodeManager. Currently, this option can");
-    pw.println("                                 only be used for finished applications.");
-    pw.println(" -size <size>                    Prints the log file's first 'n' bytes or");
-    pw.println("                                 the last 'n' bytes. Use negative values");
-    pw.println("                                 as bytes to read from the end and");
-    pw.println("                                 positive values as bytes to read from the");
-    pw.println("                                 beginning.");
+    pw.println(" -am <AM Containers>                          Prints the AM Container logs");
+    pw.println("                                              for this application.");
+    pw.println("                                              Specify comma-separated");
+    pw.println("                                              value to get logs for");
+    pw.println("                                              related AM Container. For");
+    pw.println("                                              example, If we specify -am");
+    pw.println("                                              1,2, we will get the logs");
+    pw.println("                                              for the first AM Container");
+    pw.println("                                              as well as the second AM");
+    pw.println("                                              Container. To get logs for");
+    pw.println("                                              all AM Containers, use -am");
+    pw.println("                                              ALL. To get logs for the");
+    pw.println("                                              latest AM Container, use -am");
+    pw.println("                                              -1. By default, it will");
+    pw.println("                                              print all available logs.");
+    pw.println("                                              Work with -log_files to get");
+    pw.println("                                              only specific logs.");
+    pw.println(" -appOwner <Application Owner>                AppOwner (assumed to be");
+    pw.println("                                              current user if not");
+    pw.println("                                              specified)");
+    pw.println(" -client_max_retries <Max Retries>            Set max retry number for a");
+    pw.println("                                              retry client to get the");
+    pw.println("                                              container logs for the");
+    pw.println("                                              running applications. Use a");
+    pw.println("                                              negative value to make retry");
+    pw.println("                                              forever. The default value");
+    pw.println("                                              is 30.");
+    pw.println(" -client_retry_interval_ms <Retry Interval>   Work with");
+    pw.println("                                              --client_max_retries to");
+    pw.println("                                              create a retry client. The");
+    pw.println("                                              default value is 1000.");
+    pw.println(" -clusterId <Cluster ID>                      ClusterId. By default, it");
+    pw.println("                                              will take default cluster id");
+    pw.println("                                              from the RM");
+    pw.println(" -containerId <Container ID>                  ContainerId. By default, it");
+    pw.println("                                              will print all available");
+    pw.println("                                              logs. Work with -log_files");
+    pw.println("                                              to get only specific logs.");
+    pw.println("                                              If specified, the");
+    pw.println("                                              applicationId can be omitted");
+    pw.println(" -help                                        Displays help for all");
+    pw.println("                                              commands.");
+    pw.println(" -list_nodes                                  Show the list of nodes that");
+    pw.println("                                              successfully aggregated");
+    pw.println("                                              logs. This option can only");
+    pw.println("                                              be used with finished");
+    pw.println("                                              applications.");
+    pw.println(" -log_files <Log File Name>                   Specify comma-separated");
+    pw.println("                                              value to get exact matched");
+    pw.println("                                              log files. Use \"ALL\" or \"*\"");
+    pw.println("                                              to fetch all the log files");
+    pw.println("                                              for the container.");
+    pw.println(" -log_files_pattern <Log File Pattern>        Specify comma-separated");
+    pw.println("                                              value to get matched log");
+    pw.println("                                              files by using java regex.");
+    pw.println("                                              Use \".*\" to fetch all the");
+    pw.println("                                              log files for the container.");
+    pw.println(" -nodeAddress <Node Address>                  NodeAddress in the format");
+    pw.println("                                              nodename:port");
+    pw.println(" -out <Local Directory>                       Local directory for storing");
+    pw.println("                                              individual container logs.");
+    pw.println("                                              The container logs will be");
+    pw.println("                                              stored based on the node the");
+    pw.println("                                              container ran on.");
+    pw.println(" -show_application_log_info                   Show the containerIds which");
+    pw.println("                                              belong to the specific");
+    pw.println("                                              Application. You can combine");
+    pw.println("                                              this with --nodeAddress to");
+    pw.println("                                              get containerIds for all the");
+    pw.println("                                              containers on the specific");
+    pw.println("                                              NodeManager.");
+    pw.println(" -show_container_log_info                     Show the container log");
+    pw.println("                                              metadata, including log-file");
+    pw.println("                                              names, the size of the log");
+    pw.println("                                              files. You can combine this");
+    pw.println("                                              with --containerId to get");
+    pw.println("                                              log metadata for the");
+    pw.println("                                              specific container, or with");
+    pw.println("                                              --nodeAddress to get log");
+    pw.println("                                              metadata for all the");
+    pw.println("                                              containers on the specific");
+    pw.println("                                              NodeManager.");
+    pw.println(" -size <size>                                 Prints the log file's first");
+    pw.println("                                              'n' bytes or the last 'n'");
+    pw.println("                                              bytes. Use negative values");
+    pw.println("                                              as bytes to read from the");
+    pw.println("                                              end and positive values as");
+    pw.println("                                              bytes to read from the");
+    pw.println("                                              beginning.");
+    pw.println(" -size_limit_mb <Size Limit>                  Use this option to limit the");
+    pw.println("                                              size of the total logs which");
+    pw.println("                                              could be fetched. By");
+    pw.println("                                              default, we only allow to");
+    pw.println("                                              fetch at most 10240 MB logs.");
+    pw.println("                                              If the total log size is");
+    pw.println("                                              larger than the specified");
+    pw.println("                                              number, the CLI would fail.");
+    pw.println("                                              The user could specify -1 to");
+    pw.println("                                              ignore the size limit and");
+    pw.println("                                              fetch all logs.");
     pw.close();
     String appReportStr = baos.toString("UTF-8");
-    Assert.assertEquals(appReportStr, sysOutStream.toString());
+    Assert.assertTrue(sysOutStream.toString().contains(appReportStr));
   }
 
   @Test (timeout = 15000)
-  public void testFetchApplictionLogs() throws Exception {
+  public void testFetchFinishedApplictionLogs() throws Exception {
     String remoteLogRootDir = "target/logs/";
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
       .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -258,11 +407,12 @@ public class TestLogsCLI {
 
     // create two logs for container3 in localLogDir
     logTypes.add("stdout");
+    logTypes.add("stdout1234");
     createContainerLogInLocalDir(appLogsDir, containerId3, fs, logTypes);
 
     Path path =
         new Path(remoteLogRootDir + ugi.getShortUserName()
-            + "/logs/application_0_0001");
+        + "/bucket-logs-tfile/0001/application_0_0001");
     if (fs.exists(path)) {
       fs.delete(path, true);
     }
@@ -301,53 +451,90 @@ public class TestLogsCLI {
     int exitCode = cli.run(new String[] { "-applicationId", appId.toString() });
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-      "Hello container_0_0001_01_000001 in syslog!"));
+        logMessage(containerId1, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-      "Hello container_0_0001_01_000002 in syslog!"));
+        logMessage(containerId2, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-      "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-      "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout1234")));
     sysOutStream.reset();
 
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-logFiles", ".*"});
+        "-log_files_pattern", ".*"});
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000001 in syslog!"));
+        logMessage(containerId1, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000002 in syslog!"));
+        logMessage(containerId2, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout1234")));
+    sysOutStream.reset();
+
+    exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
+        "-log_files", "*"});
+    assertTrue(exitCode == 0);
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId1, "syslog")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId2, "syslog")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "syslog")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout1234")));
     int fullSize = sysOutStream.toByteArray().length;
     sysOutStream.reset();
 
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-logFiles", "std*"});
+        "-log_files", "stdout"});
     assertTrue(exitCode == 0);
     assertFalse(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000001 in syslog!"));
+        logMessage(containerId1, "syslog")));
     assertFalse(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000002 in syslog!"));
+        logMessage(containerId2, "syslog")));
     assertFalse(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
+    assertFalse(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout1234")));
     sysOutStream.reset();
 
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-logFiles", "123"});
+        "-log_files_pattern", "std*"});
+    assertTrue(exitCode == 0);
+    assertFalse(sysOutStream.toString().contains(
+        logMessage(containerId1, "syslog")));
+    assertFalse(sysOutStream.toString().contains(
+        logMessage(containerId2, "syslog")));
+    assertFalse(sysOutStream.toString().contains(
+        logMessage(containerId3, "syslog")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout1234")));
+    sysOutStream.reset();
+
+    exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
+        "-log_files", "123"});
     assertTrue(exitCode == -1);
     assertTrue(sysErrStream.toString().contains(
-        "Can not find any log file matching the pattern: [123]"));
+        "Can not find any log file matching the pattern: [123] "
+        + "for the application: " + appId.toString()));
     sysErrStream.reset();
 
     // specify the bytes which is larger than the actual file size,
     // we would get the full logs
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-logFiles", ".*", "-size", "10000" });
+        "-log_files", "*", "-size", "10000" });
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toByteArray().length == fullSize);
     sysOutStream.reset();
@@ -361,29 +548,42 @@ public class TestLogsCLI {
             containerId1.toString() });
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000001 in syslog!"));
-    assertTrue(sysOutStream.toString().contains("Log Upload Time"));
+        logMessage(containerId1, "syslog")));
+    assertTrue(sysOutStream.toString().contains("LogLastModifiedTime"));
     assertTrue(!sysOutStream.toString().contains(
       "Logs for container " + containerId1.toString()
           + " are not present in this log-file."));
     sysOutStream.reset();
 
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-containerId", containerId3.toString(), "-logFiles", "stdout" });
+        "-containerId", containerId3.toString(), "-log_files", "123" });
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains(
+        "Can not find any log file matching the pattern: [123] "
+        + "for the container: " + containerId3
+        + " within the application: " + appId.toString()));
+    sysErrStream.reset();
+
+    exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
+        "-containerId", containerId3.toString(), "-log_files", "stdout" });
     assertTrue(exitCode == 0);
     int fullContextSize = sysOutStream.toByteArray().length;
     String fullContext = sysOutStream.toString();
     sysOutStream.reset();
 
-    String logMessage = "Hello container_0_0001_01_000003 in stdout!";
+    String logMessage = logMessage(containerId3, "stdout");
     int fileContentSize = logMessage.getBytes().length;
-    int tailContentSize = "End of LogType:syslog\n\n".getBytes().length;
-
+    StringBuilder sb = new StringBuilder();
+    String endOfFile = "End of LogType:stdout";
+    sb.append("\n" + endOfFile + "\n");
+    sb.append(StringUtils.repeat("*", endOfFile.length() + 50)
+        + "\n\n");
+    int tailContentSize = sb.toString().length();
     // specify how many bytes we should get from logs
     // specify a position number, it would get the first n bytes from
     // container log
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-containerId", containerId3.toString(), "-logFiles", "stdout",
+        "-containerId", containerId3.toString(), "-log_files", "stdout",
         "-size", "5"});
     assertTrue(exitCode == 0);
     Assert.assertEquals(new String(logMessage.getBytes(), 0, 5),
@@ -394,7 +594,7 @@ public class TestLogsCLI {
     // specify a negative number, it would get the last n bytes from
     // container log
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-containerId", containerId3.toString(), "-logFiles", "stdout",
+        "-containerId", containerId3.toString(), "-log_files", "stdout",
         "-size", "-5"});
     assertTrue(exitCode == 0);
     Assert.assertEquals(new String(logMessage.getBytes(),
@@ -405,7 +605,7 @@ public class TestLogsCLI {
 
     long negative = (fullContextSize + 1000) * (-1);
     exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
-        "-containerId", containerId3.toString(), "-logFiles", "stdout",
+        "-containerId", containerId3.toString(), "-log_files", "stdout",
         "-size", Long.toString(negative)});
     assertTrue(exitCode == 0);
     Assert.assertEquals(fullContext, sysOutStream.toString());
@@ -420,8 +620,7 @@ public class TestLogsCLI {
             containerId0.toString() });
     assertTrue(exitCode == -1);
     assertTrue(sysErrStream.toString().contains(
-      "Logs for container " + containerId0.toString()
-          + " are not present in this log-file."));
+        "Can not find any log file matching the pattern"));
     sysErrStream.reset();
 
     // uploaded two logs for container3. The first log is named as syslog.
@@ -432,22 +631,22 @@ public class TestLogsCLI {
             containerId3.toString() });
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
     sysOutStream.reset();
 
-    // set -logFiles option as stdout
+    // set -log_files option as stdout
     // should only print log with the name as stdout
     exitCode =
         cli.run(new String[] { "-applicationId", appId.toString(),
             "-nodeAddress", nodeId.toString(), "-containerId",
-            containerId3.toString() , "-logFiles", "stdout"});
+            containerId3.toString() , "-log_files", "stdout"});
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
     assertTrue(!sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     sysOutStream.reset();
 
     YarnClient mockYarnClientWithException =
@@ -460,22 +659,184 @@ public class TestLogsCLI {
             "-containerId", containerId3.toString() });
     assertTrue(exitCode == 0);
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in syslog!"));
+        logMessage(containerId3, "syslog")));
     assertTrue(sysOutStream.toString().contains(
-        "Hello container_0_0001_01_000003 in stdout!"));
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        containerId3 + " on " + LogAggregationUtils.getNodeString(nodeId)));
     sysOutStream.reset();
+
+    // The same should also work without the applicationId
+    exitCode =
+        cli.run(new String[] { "-containerId", containerId3.toString() });
+    assertTrue(exitCode == 0);
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "syslog")));
+    assertTrue(sysOutStream.toString().contains(
+        logMessage(containerId3, "stdout")));
+    assertTrue(sysOutStream.toString().contains(
+        containerId3 + " on " + LogAggregationUtils.getNodeString(nodeId)));
+    sysOutStream.reset();
+
+    exitCode = cli.run(new String[] { "-containerId", "invalid_container" });
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains(
+        "Invalid ContainerId specified"));
+    sysErrStream.reset();
 
     fs.delete(new Path(remoteLogRootDir), true);
     fs.delete(new Path(rootLogDir), true);
   }
 
-  @Test (timeout = 5000)
-  public void testFetchRunningApplicationLogs() throws Exception {
+  @Test
+  public void testCheckRetryCount() throws Exception {
     UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+
     NodeId nodeId = NodeId.newInstance("localhost", 1234);
     ApplicationId appId = ApplicationId.newInstance(0, 1);
     ApplicationAttemptId appAttemptId = ApplicationAttemptId
         .newInstance(appId, 1);
+
+    // Create a mock ApplicationAttempt Report
+    ApplicationAttemptReport mockAttemptReport = mock(
+        ApplicationAttemptReport.class);
+    doReturn(appAttemptId).when(mockAttemptReport).getApplicationAttemptId();
+    List<ApplicationAttemptReport> attemptReports = Arrays.asList(
+        mockAttemptReport);
+
+    // Create one mock containerReport
+    ContainerId containerId1 = ContainerId.newContainerId(appAttemptId, 1);
+    ContainerReport mockContainerReport1 = mock(ContainerReport.class);
+    doReturn(containerId1).when(mockContainerReport1).getContainerId();
+    doReturn(nodeId).when(mockContainerReport1).getAssignedNode();
+    doReturn("http://localhost:2345").when(mockContainerReport1)
+        .getNodeHttpAddress();
+    doReturn(ContainerState.RUNNING).when(mockContainerReport1)
+        .getContainerState();
+    List<ContainerReport> containerReports = Arrays.asList(
+        mockContainerReport1);
+    // Mock the YarnClient, and it would report the previous created
+    // mockAttemptReport and previous two created mockContainerReports
+    YarnClient mockYarnClient = createMockYarnClient(
+        YarnApplicationState.RUNNING, ugi.getShortUserName(), true,
+        attemptReports, containerReports);
+    doReturn(mockContainerReport1).when(mockYarnClient).getContainerReport(
+        any(ContainerId.class));
+    LogsCLI cli = new LogsCLIForTest(mockYarnClient);
+    cli.setConf(new YarnConfiguration());
+    try {
+      cli.run(new String[] {"-containerId",
+          containerId1.toString(), "-client_max_retries", "5"});
+      Assert.fail("Exception expected! "
+          + "NodeManager should be off to run this test. ");
+    } catch (RuntimeException ce) {
+      Assert.assertTrue(
+          "Handler exception for reason other than retry: " + ce.getMessage(),
+          ce.getMessage().contains("Connection retries limit exceeded"));
+      Assert.assertTrue("Retry filter didn't perform any retries! ", cli
+           .connectionRetry.getRetired());
+    }
+  }
+
+  @Test (timeout = 5000)
+  public void testGetRunningContainerLogs() throws Exception {
+    UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+
+    NodeId nodeId = NodeId.newInstance("localhost", 1234);
+    ApplicationId appId = ApplicationId.newInstance(0, 1);
+    ApplicationAttemptId appAttemptId = ApplicationAttemptId
+        .newInstance(appId, 1);
+
+    // Create a mock ApplicationAttempt Report
+    ApplicationAttemptReport mockAttemptReport = mock(
+        ApplicationAttemptReport.class);
+    doReturn(appAttemptId).when(mockAttemptReport).getApplicationAttemptId();
+    List<ApplicationAttemptReport> attemptReports = Arrays.asList(
+        mockAttemptReport);
+
+    // Create one mock containerReport
+    ContainerId containerId1 = ContainerId.newContainerId(appAttemptId, 1);
+    ContainerReport mockContainerReport1 = mock(ContainerReport.class);
+    doReturn(containerId1).when(mockContainerReport1).getContainerId();
+    doReturn(nodeId).when(mockContainerReport1).getAssignedNode();
+    doReturn("http://localhost:2345").when(mockContainerReport1)
+        .getNodeHttpAddress();
+    doReturn(ContainerState.RUNNING).when(mockContainerReport1)
+        .getContainerState();
+    List<ContainerReport> containerReports = Arrays.asList(
+        mockContainerReport1);
+
+    // Mock the YarnClient, and it would report the previous created
+    // mockAttemptReport and previous two created mockContainerReports
+    YarnClient mockYarnClient = createMockYarnClient(
+        YarnApplicationState.RUNNING, ugi.getShortUserName(), true,
+        attemptReports, containerReports);
+    doReturn(mockContainerReport1).when(mockYarnClient).getContainerReport(
+        any(ContainerId.class));
+
+    // create local logs
+    Configuration configuration = new YarnConfiguration();
+    FileSystem fs = FileSystem.get(configuration);
+    String rootLogDir = "target/LocalLogs";
+    Path rootLogDirPath = new Path(rootLogDir);
+    if (fs.exists(rootLogDirPath)) {
+      fs.delete(rootLogDirPath, true);
+    }
+    assertTrue(fs.mkdirs(rootLogDirPath));
+
+    Path appLogsDir = new Path(rootLogDirPath, appId.toString());
+    if (fs.exists(appLogsDir)) {
+      fs.delete(appLogsDir, true);
+    }
+    assertTrue(fs.mkdirs(appLogsDir));
+
+    String fileName = "syslog";
+    List<String> logTypes = new ArrayList<String>();
+    logTypes.add(fileName);
+    // create container logs in localLogDir
+    createContainerLogInLocalDir(appLogsDir, containerId1, fs, logTypes);
+
+    Path containerDirPath = new Path(appLogsDir, containerId1.toString());
+    Path logPath = new Path(containerDirPath, fileName);
+    File logFile = new File(logPath.toString());
+    final FileInputStream fis = new FileInputStream(logFile);
+
+    try {
+      LogsCLI cli = spy(new LogsCLIForTest(mockYarnClient));
+      Set<String> logsSet = new HashSet<String>();
+      logsSet.add(fileName);
+      doReturn(logsSet).when(cli).getMatchedContainerLogFiles(
+          any(ContainerLogsRequest.class), anyBoolean(), anyBoolean());
+      ClientResponse mockReponse = mock(ClientResponse.class);
+      doReturn(Status.OK).when(mockReponse).getStatusInfo();
+      doReturn(fis).when(mockReponse).getEntityInputStream();
+      doReturn(mockReponse).when(cli).getResponeFromNMWebService(
+          any(Configuration.class),
+          any(Client.class),
+          any(ContainerLogsRequest.class), anyString());
+      cli.setConf(new YarnConfiguration());
+      int exitCode = cli.run(new String[] {"-containerId",
+          containerId1.toString()});
+      assertTrue(exitCode == 0);
+      assertTrue(sysOutStream.toString().contains(
+          logMessage(containerId1, "syslog")));
+      sysOutStream.reset();
+    } finally {
+      IOUtils.closeQuietly(fis);
+      fs.delete(new Path(rootLogDir), true);
+    }
+  }
+
+  @Test (timeout = 5000)
+  public void testFetchRunningApplicationLogs() throws Exception {
+
+    UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
+
+    NodeId nodeId = NodeId.newInstance("localhost", 1234);
+    ApplicationId appId = ApplicationId.newInstance(0, 1);
+    ApplicationAttemptId appAttemptId = ApplicationAttemptId
+        .newInstance(appId, 1);
+
     // Create a mock ApplicationAttempt Report
     ApplicationAttemptReport mockAttemptReport = mock(
         ApplicationAttemptReport.class);
@@ -490,6 +851,7 @@ public class TestLogsCLI {
     doReturn(nodeId).when(mockContainerReport1).getAssignedNode();
     doReturn("http://localhost:2345").when(mockContainerReport1)
         .getNodeHttpAddress();
+
     ContainerId containerId2 = ContainerId.newContainerId(appAttemptId, 2);
     ContainerReport mockContainerReport2 = mock(ContainerReport.class);
     doReturn(containerId2).when(mockContainerReport2).getContainerId();
@@ -505,30 +867,74 @@ public class TestLogsCLI {
         YarnApplicationState.RUNNING, ugi.getShortUserName(), true,
         attemptReports, containerReports);
     LogsCLI cli = spy(new LogsCLIForTest(mockYarnClient));
-    doNothing().when(cli).printContainerLogsFromRunningApplication(
+    doReturn(0).when(cli).printContainerLogsFromRunningApplication(
         any(Configuration.class), any(ContainerLogsRequest.class),
-        any(LogCLIHelpers.class));
+        any(LogCLIHelpers.class), anyBoolean(), anyBoolean());
+    Set<String> logTypes = new HashSet<>();
+    logTypes.add("ALL");
+    ContainerLogsRequest mockContainer1 = mock(ContainerLogsRequest.class);
+    doReturn(logTypes).when(mockContainer1).getLogTypes();
+    ContainerLogsRequest mockContainer2 = mock(ContainerLogsRequest.class);
+    doReturn(logTypes).when(mockContainer2).getLogTypes();
+    Map<String, ContainerLogsRequest> matchedLogTypes = new HashMap<>();
+    matchedLogTypes.put(containerId1.toString(), mockContainer1);
+    matchedLogTypes.put(containerId2.toString(), mockContainer2);
+    doReturn(matchedLogTypes).when(cli).getMatchedLogTypesForRunningApp(
+        anyList(), anyBoolean(),
+        anyBoolean());
 
     cli.setConf(new YarnConfiguration());
     int exitCode = cli.run(new String[] {"-applicationId", appId.toString()});
     assertTrue(exitCode == 0);
+
+    ArgumentCaptor<ContainerLogsRequest> logsRequestCaptor =
+        ArgumentCaptor.forClass(ContainerLogsRequest.class);
+
     // we have two container reports, so make sure we have called
     // printContainerLogsFromRunningApplication twice
     verify(cli, times(2)).printContainerLogsFromRunningApplication(
+        any(Configuration.class), logsRequestCaptor.capture(),
+        any(LogCLIHelpers.class), anyBoolean(), anyBoolean());
+
+    // Verify that the log-type is "ALL"
+    List<ContainerLogsRequest> capturedRequests =
+        logsRequestCaptor.getAllValues();
+    Assert.assertEquals(2, capturedRequests.size());
+    Set<String> logTypes0 = capturedRequests.get(0).getLogTypes();
+    Set<String> logTypes1 = capturedRequests.get(1).getLogTypes();
+    Assert.assertTrue(logTypes0.contains("ALL") && (logTypes0.size() == 1));
+    Assert.assertTrue(logTypes1.contains("ALL") && (logTypes1.size() == 1));
+
+    mockYarnClient = createMockYarnClientWithException(
+        YarnApplicationState.RUNNING, ugi.getShortUserName());
+    LogsCLI cli2 = spy(new LogsCLIForTest(mockYarnClient));
+    ContainerLogsRequest newOption = mock(ContainerLogsRequest.class);
+    doReturn(newOption).when(cli2).getMatchedOptionForRunningApp(
+        any(ContainerLogsRequest.class), anyBoolean(), anyBoolean());
+    doReturn(0).when(cli2).printContainerLogsFromRunningApplication(
         any(Configuration.class), any(ContainerLogsRequest.class),
-        any(LogCLIHelpers.class));
+        any(LogCLIHelpers.class), anyBoolean(), anyBoolean());
+    doReturn("123").when(cli2).getNodeHttpAddressFromRMWebString(
+        any(ContainerLogsRequest.class));
+    cli2.setConf(new YarnConfiguration());
+    ContainerId containerId100 = ContainerId.newContainerId(appAttemptId, 100);
+    exitCode = cli2.run(new String[] {"-applicationId", appId.toString(),
+        "-containerId", containerId100.toString(), "-nodeAddress", "NM:1234"});
+    assertTrue(exitCode == 0);
+    verify(cli2, times(1)).printContainerLogsFromRunningApplication(
+        any(Configuration.class), logsRequestCaptor.capture(),
+        any(LogCLIHelpers.class), anyBoolean(), anyBoolean());
   }
 
   @Test (timeout = 15000)
   public void testFetchApplictionLogsAsAnotherUser() throws Exception {
     String remoteLogRootDir = "target/logs/";
     String rootLogDir = "target/LocalLogs";
-
     String testUser = "test";
     UserGroupInformation testUgi = UserGroupInformation
         .createRemoteUser(testUser);
 
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
         .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -564,9 +970,9 @@ public class TestLogsCLI {
       // create container logs in localLogDir for app
       createContainerLogInLocalDir(appLogsDir, containerId, fs, logTypes);
 
-      // create the remote app dir for app
-      // but for a different user testUser"
-      Path path = new Path(remoteLogRootDir + testUser + "/logs/" + appId);
+      // create the remote app dir for app but for a different user testUser
+      Path path = new Path(remoteLogRootDir + testUser +
+          "/bucket-logs-tfile/0001/" + appId);
       if (fs.exists(path)) {
         fs.delete(path, true);
       }
@@ -588,7 +994,7 @@ public class TestLogsCLI {
           "-appOwner", testUser});
       assertTrue(exitCode == 0);
       assertTrue(sysOutStream.toString().contains(
-          "Hello " + containerId + " in syslog!"));
+          logMessage(containerId, "syslog")));
       sysOutStream.reset();
 
       // Verify that we can not get the application logs
@@ -610,8 +1016,24 @@ public class TestLogsCLI {
       exitCode = cli.run(new String[] {
           "-applicationId", appId.toString()});
       assertTrue(exitCode == 0);
-      assertTrue(sysOutStream.toString().contains("Hello "
-          + containerId + " in syslog!"));
+      assertTrue(sysOutStream.toString().contains(
+          logMessage(containerId, "syslog")));
+      sysOutStream.reset();
+
+      // Verify appOwner guessed correctly with older log dir dtructure
+      path = new Path(remoteLogRootDir + testUser + "/logs/" + appId);
+      if (fs.exists(path)) {
+        fs.delete(path, true);
+      }
+      assertTrue(fs.mkdirs(path));
+      uploadContainerLogIntoRemoteDir(testUgi, configuration, rootLogDirs,
+          nodeId, containerId, path, fs);
+
+      exitCode = cli.run(new String[] {
+          "-applicationId", appId.toString()});
+      assertTrue(exitCode == 0);
+      assertTrue(sysOutStream.toString().contains(
+          logMessage(containerId, "syslog")));
       sysOutStream.reset();
 
       // Verify that we could get the err message "Can not find the appOwner"
@@ -632,7 +1054,7 @@ public class TestLogsCLI {
           System.currentTimeMillis(), 1000);
       String priorityUser = "priority";
       Path pathWithoutPerm = new Path(remoteLogRootDir + priorityUser
-          + "/logs/" + appTest);
+          + "/bucket-logs-tfile/1000/" + appTest);
       if (fs.exists(pathWithoutPerm)) {
         fs.delete(pathWithoutPerm, true);
       }
@@ -646,13 +1068,158 @@ public class TestLogsCLI {
           "-applicationId", appTest.toString()});
       assertTrue(exitCode == -1);
       assertTrue(sysErrStream.toString().contains(
-        "Guessed logs' owner is " + priorityUser + " and current user "
-            + UserGroupInformation.getCurrentUser().getUserName()
-            + " does not have permission to access"));
+          "Can not find the logs for the application: "
+          + appTest.toString()));
       sysErrStream.reset();
     } finally {
       fs.delete(new Path(remoteLogRootDir), true);
       fs.delete(new Path(rootLogDir), true);
+    }
+  }
+
+  @Test (timeout = 5000)
+  public void testLogsCLIWithInvalidArgs() throws Exception {
+    String localDir = "target/SaveLogs";
+    Path localPath = new Path(localDir);
+    Configuration configuration = new YarnConfiguration();
+    FileSystem fs = FileSystem.get(configuration);
+    ApplicationId appId = ApplicationId.newInstance(0, 1);
+    YarnClient mockYarnClient =
+        createMockYarnClient(YarnApplicationState.FINISHED,
+        UserGroupInformation.getCurrentUser().getShortUserName());
+    LogsCLI cli = new LogsCLIForTest(mockYarnClient);
+    cli.setConf(configuration);
+
+    // Specify an invalid applicationId
+    int exitCode = cli.run(new String[] {"-applicationId",
+        "123"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains(
+        "Invalid ApplicationId specified"));
+    sysErrStream.reset();
+
+    // Specify an invalid containerId
+    exitCode = cli.run(new String[] {"-containerId",
+        "123"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains(
+        "Invalid ContainerId specified"));
+    sysErrStream.reset();
+
+    // Specify show_container_log_info and show_application_log_info
+    // at the same time
+    exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_container_log_info", "-show_application_log_info"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains("Invalid options. "
+        + "Can only accept one of show_application_log_info/"
+        + "show_container_log_info."));
+    sysErrStream.reset();
+
+    // Specify log_files and log_files_pattern
+    // at the same time
+    exitCode = cli.run(new String[] {"-applicationId", appId.toString(),
+        "-log_files", "*", "-log_files_pattern", ".*"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains("Invalid options. "
+        + "Can only accept one of log_files/"
+        + "log_files_pattern."));
+    sysErrStream.reset();
+
+    // Specify a file name to the option -out
+    try {
+      fs.mkdirs(localPath);
+      Path tmpFilePath = new Path(localPath, "tmpFile");
+      if (!fs.exists(tmpFilePath)) {
+        fs.createNewFile(tmpFilePath);
+      }
+      exitCode = cli.run(new String[] {"-applicationId",
+          appId.toString(),
+          "-out" , tmpFilePath.toString()});
+      assertTrue(exitCode == -1);
+      assertTrue(sysErrStream.toString().contains(
+          "Invalid value for -out option. Please provide a directory."));
+    } finally {
+      fs.delete(localPath, true);
+    }
+  }
+
+  @Test (timeout = 5000)
+  public void testGuessAppOwnerWithCustomSuffix() throws Exception {
+    String remoteLogRootDir = "target/logs/";
+    String jobUser = "user1";
+    String loggedUser = "user2";
+    Configuration conf = new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
+    conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
+    conf.setBoolean(YarnConfiguration.YARN_ACL_ENABLE, true);
+    conf.set(YarnConfiguration.YARN_ADMIN_ACL, "admin");
+    String controllerName = "indexed";
+    conf.set(YarnConfiguration.LOG_AGGREGATION_FILE_FORMATS, controllerName);
+    conf.set(String.format(LOG_AGGREGATION_FILE_CONTROLLER_FMT,
+         controllerName), LogAggregationIndexedFileController.class.getName());
+    conf.set(String.format(LOG_AGGREGATION_REMOTE_APP_LOG_DIR_SUFFIX_FMT,
+         controllerName), controllerName);
+
+    FileSystem fs = FileSystem.get(conf);
+    try {
+      // Test New App Log Dir Struture (after YARN-6929) with Custom Suffix
+      ApplicationId appId1 = ApplicationId.newInstance(0, 1);
+      Path path = new Path(remoteLogRootDir + jobUser + "/bucket-indexed/0001/"
+          + appId1);
+      if (fs.exists(path)) {
+        fs.delete(path, true);
+      }
+      assertTrue(fs.mkdirs(path));
+      String appOwner = LogCLIHelpers.getOwnerForAppIdOrNull(appId1,
+          loggedUser, conf);
+      assertThat(appOwner).isEqualTo(jobUser);
+
+      // Test Old App Log Dir Struture (before YARN-6929) with Custom Suffix
+      ApplicationId appId2 = ApplicationId.newInstance(0, 2);
+      path = new Path(remoteLogRootDir + jobUser + "/indexed/" + appId2);
+      if (fs.exists(path)) {
+        fs.delete(path, true);
+      }
+      assertTrue(fs.mkdirs(path));
+      appOwner = LogCLIHelpers.getOwnerForAppIdOrNull(appId2, loggedUser, conf);
+      assertThat(appOwner).isEqualTo(jobUser);
+    } finally {
+      fs.delete(new Path(remoteLogRootDir), true);
+    }
+  }
+
+  @Test (timeout = 5000)
+  public void testGuessAppOwnerWithCustomAppLogDir() throws Exception {
+    String remoteLogRootDir = "target/logs/";
+    String remoteLogRootDir1 = "target/logs1/";
+    String jobUser = "user1";
+    String loggedUser = "user2";
+    Configuration conf = new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
+    conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
+    String controllerName = "indexed";
+    conf.set(YarnConfiguration.LOG_AGGREGATION_FILE_FORMATS, controllerName);
+    conf.set(String.format(LOG_AGGREGATION_FILE_CONTROLLER_FMT,
+         controllerName), LogAggregationIndexedFileController.class.getName());
+    conf.set(String.format(LOG_AGGREGATION_REMOTE_APP_LOG_DIR_FMT,
+         controllerName), remoteLogRootDir1);
+
+    FileSystem fs = FileSystem.get(conf);
+    try {
+      // Test Custom App Log Dir Structure
+      ApplicationId appId1 = ApplicationId.newInstance(0, 3);
+      Path path = new Path(remoteLogRootDir1 + jobUser +
+          "/bucket-logs-indexed/0003/" + appId1);
+      if (fs.exists(path)) {
+        fs.delete(path, true);
+      }
+      assertTrue(fs.mkdirs(path));
+      String appOwner = LogCLIHelpers.getOwnerForAppIdOrNull(appId1,
+          loggedUser, conf);
+      assertThat(appOwner).isEqualTo(jobUser);
+    } finally {
+      fs.delete(new Path(remoteLogRootDir1), true);
     }
   }
 
@@ -663,7 +1230,7 @@ public class TestLogsCLI {
     String localDir = "target/SaveLogs";
     Path localPath = new Path(localDir);
 
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
         .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -716,16 +1283,14 @@ public class TestLogsCLI {
       assertTrue(container1Dir[0].getPath().getName().equals(
           containerId1.toString()));
       String container1= readContainerContent(container1Dir[0].getPath(), fs);
-      assertTrue(container1.contains("Hello " + containerId1
-          + " in syslog!"));
+      assertTrue(container1.contains(logMessage(containerId1, "syslog")));
 
       FileStatus[] container2Dir = fs.listStatus(nodeDir[1].getPath());
       assertTrue(container2Dir.length == 1);
       assertTrue(container2Dir[0].getPath().getName().equals(
           containerId2.toString()));
       String container2= readContainerContent(container2Dir[0].getPath(), fs);
-      assertTrue(container2.contains("Hello " + containerId2
-          + " in syslog!"));
+      assertTrue(container2.contains(logMessage(containerId2, "syslog")));
     } finally {
       fs.delete(new Path(remoteLogRootDir), true);
       fs.delete(new Path(rootLogDir), true);
@@ -756,7 +1321,7 @@ public class TestLogsCLI {
   @Test (timeout = 15000)
   public void testPrintContainerLogMetadata() throws Exception {
     String remoteLogRootDir = "target/logs/";
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
       .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -790,49 +1355,69 @@ public class TestLogsCLI {
     LogsCLI cli = new LogsCLIForTest(mockYarnClient);
     cli.setConf(configuration);
 
-    cli.run(new String[] { "-applicationId", appId.toString(),
-        "-show_meta_info" });
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_container_log_info"});
     assertTrue(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000001 on localhost_"));
     assertTrue(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000002 on localhost_"));
     assertTrue(sysOutStream.toString().contains(
-        "LogType:syslog"));
+        "syslog"));
     assertTrue(sysOutStream.toString().contains(
-        "LogLength:43"));
+        "43"));
     sysOutStream.reset();
 
-    cli.run(new String[] { "-applicationId", appId.toString(),
-        "-show_meta_info", "-containerId", "container_0_0001_01_000001" });
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_container_log_info", "-containerId",
+        "container_0_0001_01_000001"});
     assertTrue(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000001 on localhost_"));
     assertFalse(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000002 on localhost_"));
     assertTrue(sysOutStream.toString().contains(
-        "LogType:syslog"));
+        "syslog"));
     assertTrue(sysOutStream.toString().contains(
-        "LogLength:43"));
+        "43"));
     sysOutStream.reset();
 
-    cli.run(new String[] { "-applicationId", appId.toString(),
-        "-show_meta_info", "-nodeAddress", "localhost" });
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_container_log_info", "-nodeAddress", "localhost"});
     assertTrue(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000001 on localhost_"));
     assertTrue(sysOutStream.toString().contains(
         "Container: container_0_0001_01_000002 on localhost_"));
     assertTrue(sysOutStream.toString().contains(
-        "LogType:syslog"));
+        "syslog"));
     assertTrue(sysOutStream.toString().contains(
-        "LogLength:43"));
+        "43"));
     sysOutStream.reset();
 
-    cli.run(new String[] { "-applicationId", appId.toString(),
-        "-show_meta_info", "-nodeAddress", "localhost", "-containerId",
-        "container_1234" });
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_container_log_info", "-nodeAddress", "localhost",
+        "-containerId", "container_1234"});
     assertTrue(sysErrStream.toString().contains(
-        "The container container_1234 couldn't be found on the node "
-        + "specified: localhost"));
+        "Invalid ContainerId specified"));
     sysErrStream.reset();
+
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_application_log_info"});
+    assertTrue(sysOutStream.toString().contains(
+        "Application State: Completed."));
+    assertTrue(sysOutStream.toString().contains(
+        "container_0_0001_01_000001 on localhost"));
+    assertTrue(sysOutStream.toString().contains(
+        "container_0_0001_01_000002 on localhost"));
+    sysOutStream.reset();
+
+    cli.run(new String[] {"-applicationId", appId.toString(),
+        "-show_application_log_info", "-nodeAddress", "localhost"});
+    assertTrue(sysOutStream.toString().contains(
+        "Application State: Completed."));
+    assertTrue(sysOutStream.toString().contains(
+        "container_0_0001_01_000001 on localhost"));
+    assertTrue(sysOutStream.toString().contains(
+        "container_0_0001_01_000002 on localhost"));
+    sysOutStream.reset();
 
     fs.delete(new Path(remoteLogRootDir), true);
     fs.delete(new Path(rootLogDir), true);
@@ -841,7 +1426,7 @@ public class TestLogsCLI {
   @Test (timeout = 15000)
   public void testListNodeInfo() throws Exception {
     String remoteLogRootDir = "target/logs/";
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
       .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -892,7 +1477,7 @@ public class TestLogsCLI {
   @Test (timeout = 15000)
   public void testFetchApplictionLogsHar() throws Exception {
     String remoteLogRootDir = "target/logs/";
-    Configuration configuration = new Configuration();
+    Configuration configuration = new YarnConfiguration();
     configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED, true);
     configuration
         .set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR, remoteLogRootDir);
@@ -905,7 +1490,7 @@ public class TestLogsCLI {
     assertNotNull(harUrl);
     Path path =
         new Path(remoteLogRootDir + ugi.getShortUserName()
-            + "/logs/application_1440536969523_0001");
+            + "/bucket-logs-tfile/0001/application_1440536969523_0001");
     if (fs.exists(path)) {
       fs.delete(path, true);
     }
@@ -966,7 +1551,7 @@ public class TestLogsCLI {
     }
     Path path =
         new Path(remoteLogRootDir + ugi.getShortUserName()
-        + "/logs/application_0_0001");
+        + "/bucket-logs-tfile/0001/application_0_0001");
 
     if (fs.exists(path)) {
       fs.delete(path, true);
@@ -988,9 +1573,15 @@ public class TestLogsCLI {
     for (String logType : logTypes) {
       Writer writer =
           new FileWriter(new File(containerLogsDir.toString(), logType));
-      writer.write("Hello " + containerId + " in " + logType + "!");
+      writer.write(logMessage(containerId, logType));
       writer.close();
     }
+  }
+
+  private static String logMessage(ContainerId containerId, String logType) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("Hello " + containerId + " in " + logType + "!");
+    return sb.toString();
   }
 
   private static void uploadContainerLogIntoRemoteDir(UserGroupInformation ugi,
@@ -999,43 +1590,56 @@ public class TestLogsCLI {
     Path path =
         new Path(appDir, LogAggregationUtils.getNodeString(nodeId)
             + System.currentTimeMillis());
-    AggregatedLogFormat.LogWriter writer =
-        new AggregatedLogFormat.LogWriter(configuration, path, ugi);
-    writer.writeApplicationOwner(ugi.getUserName());
-
-    Map<ApplicationAccessType, String> appAcls =
-        new HashMap<ApplicationAccessType, String>();
-    appAcls.put(ApplicationAccessType.VIEW_APP, ugi.getUserName());
-    writer.writeApplicationACLs(appAcls);
-    writer.append(new AggregatedLogFormat.LogKey(containerId),
-      new AggregatedLogFormat.LogValue(rootLogDirs, containerId,
-        UserGroupInformation.getCurrentUser().getShortUserName()));
-    writer.close();
+    LogAggregationFileControllerFactory factory
+        = new LogAggregationFileControllerFactory(configuration);
+    LogAggregationFileController fileFormat = factory
+        .getFileControllerForWrite();
+    try {
+      Map<ApplicationAccessType, String> appAcls = new HashMap<>();
+      appAcls.put(ApplicationAccessType.VIEW_APP, ugi.getUserName());
+      LogAggregationFileControllerContext context
+          = new LogAggregationFileControllerContext(
+              path, path, true, 1000,
+              containerId.getApplicationAttemptId().getApplicationId(),
+              appAcls, nodeId, ugi);
+      fileFormat.initializeWriter(context);
+      fileFormat.write(new AggregatedLogFormat.LogKey(containerId),
+          new AggregatedLogFormat.LogValue(rootLogDirs, containerId,
+              UserGroupInformation.getCurrentUser().getShortUserName()));
+    } finally {
+      fileFormat.closeWriter();
+    }
   }
 
+  @SuppressWarnings("static-access")
   private static void uploadEmptyContainerLogIntoRemoteDir(UserGroupInformation ugi,
       Configuration configuration, List<String> rootLogDirs, NodeId nodeId,
       ContainerId containerId, Path appDir, FileSystem fs) throws Exception {
-    Path path =
-        new Path(appDir, LogAggregationUtils.getNodeString(nodeId)
-            + System.currentTimeMillis());
-    AggregatedLogFormat.LogWriter writer =
-        new AggregatedLogFormat.LogWriter(configuration, path, ugi);
-    writer.writeApplicationOwner(ugi.getUserName());
-
-    Map<ApplicationAccessType, String> appAcls =
-        new HashMap<ApplicationAccessType, String>();
-    appAcls.put(ApplicationAccessType.VIEW_APP, ugi.getUserName());
-    writer.writeApplicationACLs(appAcls);
-    DataOutputStream out = writer.getWriter().prepareAppendKey(-1);
-    new AggregatedLogFormat.LogKey(containerId).write(out);
-    out.close();
-    out = writer.getWriter().prepareAppendValue(-1);
-    new AggregatedLogFormat.LogValue(rootLogDirs, containerId,
-      UserGroupInformation.getCurrentUser().getShortUserName()).write(out,
-      new HashSet<File>());
-    out.close();
-    writer.close();
+    LogAggregationFileControllerFactory factory
+        = new LogAggregationFileControllerFactory(configuration);
+    LogAggregationFileController fileFormat = factory
+        .getFileControllerForWrite();
+    try {
+      Map<ApplicationAccessType, String> appAcls = new HashMap<>();
+      appAcls.put(ApplicationAccessType.VIEW_APP, ugi.getUserName());
+      ApplicationId appId = containerId.getApplicationAttemptId()
+          .getApplicationId();
+      Path path = fileFormat.getRemoteNodeLogFileForApp(
+          appId, ugi.getCurrentUser().getShortUserName(), nodeId);
+      LogAggregationFileControllerContext context
+          = new LogAggregationFileControllerContext(
+              path, path, true, 1000,
+              appId, appAcls, nodeId, ugi);
+      fileFormat.initializeWriter(context);
+      AggregatedLogFormat.LogKey key = new AggregatedLogFormat.LogKey(
+          containerId);
+      AggregatedLogFormat.LogValue value = new AggregatedLogFormat.LogValue(
+          rootLogDirs, containerId, UserGroupInformation.getCurrentUser()
+              .getShortUserName());
+      fileFormat.write(key, value);
+    } finally {
+      fileFormat.closeWriter();
+    }
   }
 
   private YarnClient createMockYarnClient(YarnApplicationState appState,
@@ -1059,6 +1663,20 @@ public class TestLogsCLI {
       doReturn(mockContainers).when(mockClient).getContainers(any(
           ApplicationAttemptId.class));
     }
+    return mockClient;
+  }
+
+  private YarnClient createMockYarnClientWithException(
+      YarnApplicationState appState, String user)
+      throws YarnException, IOException {
+    YarnClient mockClient = mock(YarnClient.class);
+    ApplicationReport mockAppReport = mock(ApplicationReport.class);
+    doReturn(user).when(mockAppReport).getUser();
+    doReturn(appState).when(mockAppReport).getYarnApplicationState();
+    doReturn(mockAppReport).when(mockClient).getApplicationReport(
+        any(ApplicationId.class));
+    doThrow(new YarnException()).when(mockClient).getContainerReport(
+        any(ContainerId.class));
     return mockClient;
   }
 

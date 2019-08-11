@@ -17,8 +17,7 @@
  */
 package org.apache.hadoop.security.token.delegation.web;
 
-import static org.apache.hadoop.security.token.delegation.web.DelegationTokenAuthenticator.DelegationTokenOperation;
-
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.minikdc.MiniKdc;
@@ -33,25 +32,23 @@ import org.apache.hadoop.security.authentication.server.PseudoAuthenticationHand
 import org.apache.hadoop.security.authentication.util.KerberosUtil;
 import org.apache.hadoop.security.token.delegation.AbstractDelegationTokenSecretManager;
 import org.apache.hadoop.test.GenericTestUtils;
-import org.codehaus.jackson.map.ObjectMapper;
+import org.eclipse.jetty.server.Server;
+import org.eclipse.jetty.server.ServerConnector;
+import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-import org.mortbay.jetty.AbstractConnector;
-import org.mortbay.jetty.Connector;
-import org.mortbay.jetty.Server;
-import org.mortbay.jetty.servlet.Context;
-import org.mortbay.jetty.servlet.FilterHolder;
-import org.mortbay.jetty.servlet.ServletHolder;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.eclipse.jetty.servlet.FilterHolder;
+import org.eclipse.jetty.servlet.ServletHolder;
+import org.slf4j.event.Level;
 
 import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
 import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
+import javax.servlet.DispatcherType;
 import javax.servlet.Filter;
 import javax.servlet.FilterConfig;
 import javax.servlet.ServletException;
@@ -69,6 +66,7 @@ import java.net.URL;
 import java.security.Principal;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -79,9 +77,6 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 
 public class TestWebDelegationToken {
-
-  private static final Logger LOG =
-      LoggerFactory.getLogger(TestWebDelegationToken.class);
   private static final String OK_USER = "ok-user";
   private static final String FAIL_USER = "fail-user";
   private static final String FOO_USER = "foo";
@@ -117,7 +112,7 @@ public class TestWebDelegationToken {
       AuthenticationToken token = null;
       if (request.getParameter("authenticated") != null) {
         token = new AuthenticationToken(request.getParameter("authenticated"),
-            "U", "unsupported type");
+            "U", "test");
       } else {
         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.setHeader(KerberosAuthenticator.WWW_AUTHENTICATE, "dummy");
@@ -140,32 +135,6 @@ public class TestWebDelegationToken {
     }
   }
 
-  /**
-   * A dummy DelegationTokenAuthenticationHandler to verify that the request
-   * header contains delegation token.
-   */
-  public static class HeaderVerifyingDelegationTokenAuthenticationHandler
-      extends DummyDelegationTokenAuthenticationHandler {
-
-    @Override
-    public boolean managementOperation(AuthenticationToken token,
-        HttpServletRequest request, HttpServletResponse response)
-        throws IOException, AuthenticationException {
-      String op = ServletUtils.getParameter(request,
-          KerberosDelegationTokenAuthenticator.OP_PARAM);
-      if (op != null) {
-        DelegationTokenOperation dtOp = DelegationTokenOperation.valueOf(op);
-        if (dtOp == DelegationTokenOperation.RENEWDELEGATIONTOKEN
-            || dtOp == DelegationTokenOperation.CANCELDELEGATIONTOKEN) {
-          Assert.assertNotNull("Request header should have delegation token",
-              request.getHeader(
-                  DelegationTokenAuthenticator.DELEGATION_TOKEN_HEADER));
-        }
-      }
-      return super.managementOperation(token, request, response);
-    }
-  }
-
   public static class AFilter extends DelegationTokenAuthenticationFilter {
 
     @Override
@@ -174,24 +143,6 @@ public class TestWebDelegationToken {
       Properties conf = new Properties();
       conf.setProperty(AUTH_TYPE,
           DummyDelegationTokenAuthenticationHandler.class.getName());
-      return conf;
-    }
-  }
-
-  /**
-   * A dummy DelegationTokenAuthenticationFilter that uses a
-   * {@link HeaderVerifyingDelegationTokenAuthenticationHandler} to verify that
-   * the request header contains delegation token.
-   */
-  public static class HeaderVerifyingFilter
-      extends DelegationTokenAuthenticationFilter {
-
-    @Override
-    protected Properties getConfiguration(String configPrefix,
-        FilterConfig filterConfig) {
-      Properties conf = new Properties();
-      conf.setProperty(AUTH_TYPE,
-          HeaderVerifyingDelegationTokenAuthenticationHandler.class.getName());
       return conf;
     }
   }
@@ -227,7 +178,7 @@ public class TestWebDelegationToken {
   protected Server createJettyServer() {
     try {
       jetty = new Server(0);
-      jetty.getConnectors()[0].setHost("localhost");
+      ((ServerConnector)jetty.getConnectors()[0]).setHost("localhost");
       return jetty;
     } catch (Exception ex) {
       throw new RuntimeException("Could not setup Jetty: " + ex.getMessage(),
@@ -236,7 +187,7 @@ public class TestWebDelegationToken {
   }
 
   protected String getJettyURL() {
-    Connector c = jetty.getConnectors()[0];
+    ServerConnector c = (ServerConnector)jetty.getConnectors()[0];
     return "http://" + c.getHost() + ":" + c.getLocalPort();
   }
 
@@ -248,12 +199,13 @@ public class TestWebDelegationToken {
     UserGroupInformation.setConfiguration(conf);
 
     jetty = createJettyServer();
+    GenericTestUtils.setLogLevel(KerberosAuthenticationHandler.LOG,
+        Level.TRACE);
   }
 
   @After
   public void cleanUp() throws Exception {
     jetty.stop();
-    jetty = null;
 
     // resetting hadoop security to simple
     org.apache.hadoop.conf.Configuration conf =
@@ -268,10 +220,11 @@ public class TestWebDelegationToken {
   @Test
   public void testRawHttpCalls() throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(AFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(AFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(PingServlet.class), "/bar");
     try {
       jetty.start();
@@ -388,10 +341,11 @@ public class TestWebDelegationToken {
   private void testDelegationTokenAuthenticatorCalls(final boolean useQS)
       throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(AFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(AFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(PingServlet.class), "/bar");
 
     try {
@@ -410,7 +364,7 @@ public class TestWebDelegationToken {
         aUrl.getDelegationToken(nonAuthURL, token, FOO_USER);
         Assert.fail();
       } catch (Exception ex) {
-        Assert.assertTrue(ex.getMessage().contains("401"));
+        Assert.assertTrue(ex.getCause().getMessage().contains("401"));
       }
 
       aUrl.getDelegationToken(authURL, token, FOO_USER);
@@ -478,63 +432,6 @@ public class TestWebDelegationToken {
     }
   }
 
-  @Test(timeout=120000)
-  public void testDelegationTokenAuthenticatorUsingDT() throws Exception {
-    Context context = new Context();
-    context.setContextPath("/foo");
-    jetty.setHandler(context);
-    context.addFilter(new FilterHolder(HeaderVerifyingFilter.class), "/*", 0);
-    context.addServlet(new ServletHolder(PingServlet.class), "/bar");
-
-    jetty.start();
-    final URL nonAuthURL = new URL(getJettyURL() + "/foo/bar");
-    URL authURL = new URL(getJettyURL() + "/foo/bar?authenticated=foo");
-    URL authURL2 = new URL(getJettyURL() + "/foo/bar?authenticated=bar");
-
-    DelegationTokenAuthenticatedURL.Token token =
-        new DelegationTokenAuthenticatedURL.Token();
-    final DelegationTokenAuthenticatedURL aUrl =
-        new DelegationTokenAuthenticatedURL();
-    aUrl.getDelegationToken(authURL, token, FOO_USER);
-    Assert.assertNotNull(token.getDelegationToken());
-    Assert.assertEquals(new Text("token-kind"),
-        token.getDelegationToken().getKind());
-
-    // Create a token that only has dt so that we can test ops when
-    // authenticating with a delegation token.
-    DelegationTokenAuthenticatedURL.Token dtOnlyToken =
-        new DelegationTokenAuthenticatedURL.Token();
-    dtOnlyToken.setDelegationToken(token.getDelegationToken());
-
-    /**
-     * We're using delegation token, so everything comes from that.
-     * {@link DelegationTokenAuthenticationHandler#authenticate}.
-     *
-     * This means that the special logic we injected at
-     * {@link DummyAuthenticationHandler#authenticate}
-     * (check "authenticated" and return 401) wouldn't work any more.
-     */
-
-    aUrl.getDelegationToken(authURL, dtOnlyToken, FOO_USER);
-    aUrl.renewDelegationToken(authURL, dtOnlyToken);
-    aUrl.renewDelegationToken(nonAuthURL, dtOnlyToken);
-    aUrl.renewDelegationToken(authURL2, dtOnlyToken);
-
-    // Verify that after cancelling, we can't renew.
-    // After cancelling, the dt on token will be set to null. Back it up here.
-    DelegationTokenAuthenticatedURL.Token cancelledToken =
-        new DelegationTokenAuthenticatedURL.Token();
-    cancelledToken.setDelegationToken(dtOnlyToken.getDelegationToken());
-    aUrl.cancelDelegationToken(authURL, dtOnlyToken);
-    try {
-      aUrl.renewDelegationToken(authURL, cancelledToken);
-      Assert.fail();
-    } catch (Exception ex) {
-      LOG.info("Intentional exception caught:", ex);
-      GenericTestUtils.assertExceptionContains("can't be found in cache", ex);
-    }
-  }
-
   private static class DummyDelegationTokenSecretManager
       extends AbstractDelegationTokenSecretManager<DelegationTokenIdentifier> {
 
@@ -554,10 +451,11 @@ public class TestWebDelegationToken {
     DummyDelegationTokenSecretManager secretMgr
         = new DummyDelegationTokenSecretManager();
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(AFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(AFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(PingServlet.class), "/bar");
     try {
       secretMgr.startThreads();
@@ -633,10 +531,11 @@ public class TestWebDelegationToken {
   private void testDelegationTokenAuthenticatedURLWithNoDT(
       Class<? extends Filter> filterClass)  throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(filterClass), "/*", 0);
+    context.addFilter(new FilterHolder(filterClass), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UserServlet.class), "/bar");
 
     try {
@@ -702,10 +601,11 @@ public class TestWebDelegationToken {
   public void testFallbackToPseudoDelegationTokenAuthenticator()
       throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UserServlet.class), "/bar");
 
     try {
@@ -853,11 +753,11 @@ public class TestWebDelegationToken {
     Assert.assertTrue(testDir.mkdirs());
     MiniKdc kdc = new MiniKdc(MiniKdc.createConf(), testDir);
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    ((AbstractConnector)jetty.getConnectors()[0]).setResolveNames(true);
-    context.addFilter(new FilterHolder(KDTAFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(KDTAFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UserServlet.class), "/bar");
     try {
       kdc.start();
@@ -876,7 +776,7 @@ public class TestWebDelegationToken {
         aUrl.getDelegationToken(url, token, FOO_USER, doAsUser);
         Assert.fail();
       } catch (AuthenticationException ex) {
-        Assert.assertTrue(ex.getMessage().contains("GSSException"));
+        Assert.assertTrue(ex.getCause().getMessage().contains("GSSException"));
       }
 
       doAsKerberosUser("client", keytabFile.getAbsolutePath(),
@@ -932,10 +832,11 @@ public class TestWebDelegationToken {
   @Test
   public void testProxyUser() throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UserServlet.class), "/bar");
 
     try {
@@ -1029,10 +930,11 @@ public class TestWebDelegationToken {
   @Test
   public void testHttpUGI() throws Exception {
     final Server jetty = createJettyServer();
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
-    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(PseudoDTAFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UGIServlet.class), "/bar");
 
     try {
@@ -1088,12 +990,12 @@ public class TestWebDelegationToken {
   @Test
   public void testIpaddressCheck() throws Exception {
     final Server jetty = createJettyServer();
-    ((AbstractConnector)jetty.getConnectors()[0]).setResolveNames(true);
-    Context context = new Context();
+    ServletContextHandler context = new ServletContextHandler();
     context.setContextPath("/foo");
     jetty.setHandler(context);
 
-    context.addFilter(new FilterHolder(IpAddressBasedPseudoDTAFilter.class), "/*", 0);
+    context.addFilter(new FilterHolder(IpAddressBasedPseudoDTAFilter.class), "/*",
+        EnumSet.of(DispatcherType.REQUEST));
     context.addServlet(new ServletHolder(UGIServlet.class), "/bar");
 
     try {

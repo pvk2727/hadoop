@@ -17,11 +17,11 @@
  */
 package org.apache.hadoop.io.erasurecode.rawcoder.util;
 
-import org.apache.hadoop.classification.InterfaceAudience;
-
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
+
+import org.apache.hadoop.classification.InterfaceAudience;
 
 /**
  * Implementation of Galois field arithmetic with 2^p elements. The input must
@@ -518,7 +518,7 @@ public class GaloisField {
 
   /**
    * Perform Gaussian elimination on the given matrix. This matrix has to be a
-   * fat matrix (number of rows > number of columns).
+   * fat matrix (number of rows &gt; number of columns).
    */
   public void gaussianElimination(int[][] matrix) {
     assert(matrix != null && matrix.length > 0 && matrix[0].length > 0

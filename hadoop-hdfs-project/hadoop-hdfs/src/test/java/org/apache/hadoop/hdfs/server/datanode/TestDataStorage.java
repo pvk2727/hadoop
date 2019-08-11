@@ -47,8 +47,7 @@ public class TestDataStorage {
   private final static String BUILD_VERSION = "2.0";
   private final static String SOFTWARE_VERSION = "2.0";
   private final static long CTIME = 1;
-  private final static File TEST_DIR =
-      new File(System.getProperty("test.build.data") + "/dstest");
+  private final static File TEST_DIR = GenericTestUtils.getTestDir("dstest");
   private final static StartupOption START_OPT = StartupOption.REGULAR;
 
   private DataNode mockDN = Mockito.mock(DataNode.class);
@@ -143,8 +142,8 @@ public class TestDataStorage {
     for (NamespaceInfo ni : namespaceInfos) {
       storage.addStorageLocations(mockDN, ni, locations, START_OPT);
       for (StorageLocation sl : locations) {
-        checkDir(sl.getFile());
-        checkDir(sl.getFile(), ni.getBlockPoolID());
+        checkDir(new File(sl.getUri()));
+        checkDir(new File(sl.getUri()), ni.getBlockPoolID());
       }
     }
 
@@ -174,8 +173,7 @@ public class TestDataStorage {
     List<StorageLocation> locations = createStorageLocations(numLocations);
 
     StorageLocation firstStorage = locations.get(0);
-    Storage.StorageDirectory sd = new Storage.StorageDirectory(
-        firstStorage.getFile());
+    Storage.StorageDirectory sd = new Storage.StorageDirectory(firstStorage);
     // the directory is not initialized so VERSION does not exist
     // create a fake directory under current/
     File currentDir = new File(sd.getCurrentDir(),
@@ -202,7 +200,7 @@ public class TestDataStorage {
       fail("An IOException should throw: all StorageLocations are NON_EXISTENT");
     } catch (IOException e) {
       GenericTestUtils.assertExceptionContains(
-          "All specified directories are failed to load.", e);
+          "All specified directories have failed to load.", e);
     }
     assertEquals(0, storage.getNumStorageDirs());
   }
